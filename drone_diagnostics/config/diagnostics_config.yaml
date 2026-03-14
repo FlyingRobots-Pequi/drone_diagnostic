@@ -1,0 +1,30 @@
+diagnostic_aggregator:
+  ros__parameters:
+    pub_rate: 1.0
+    analyzers:
+      px4:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: PX4
+        contains:
+          - "PX4:"
+      vio:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: VIO
+        contains:
+          - "VIO:"
+      system:
+        type: diagnostic_aggregator/GenericAnalyzer
+        path: System
+        contains:
+          - "System:"
+
+drone_diagnostic:
+  ros__parameters:
+    # Thresholds — tune without rebuilding
+    max_pos_variance_m2: 0.25       # warn if position std dev > 0.5m
+    max_vel_variance_m2s2: 0.10
+    cpu_warn_pct: 0.70
+    cpu_error_pct: 0.90
+    ram_warn_pct: 0.80
+    timesync_warn_us: 500           # µs — warn if |offset| > 500µs
+    timesync_error_us: 2000         # µs — error if |offset| > 2ms
