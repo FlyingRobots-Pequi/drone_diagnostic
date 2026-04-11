@@ -20,11 +20,41 @@ diagnostic_aggregator:
 
 drone_diagnostic:
   ros__parameters:
-    # Thresholds — tune without rebuilding
-    max_pos_variance_m2: 0.25       # warn if position std dev > 0.5m
-    max_vel_variance_m2s2: 0.10
-    cpu_warn_pct: 0.70
-    cpu_error_pct: 0.90
-    ram_warn_pct: 0.80
-    timesync_warn_us: 500           # µs — warn if |offset| > 500µs
-    timesync_error_us: 2000         # µs — error if |offset| > 2ms
+    # ── Node settings ──────────────────────────────────────────────────────────
+    drone_namespace: /pequi/hermit
+    topic_timeout_sec: 2.0          # seconds before a topic is considered stale
+    publish_rate_hz: 2.0            # diagnostic publish rate
+
+    # ── CPU / RAM (PX4: CPU Load) ──────────────────────────────────────────────
+    cpu_warn_pct: 0.70              # warn  if cpu load  > 70 %
+    cpu_error_pct: 0.90             # error if cpu load  > 90 %
+    ram_warn_pct: 0.80              # error if ram usage > 80 %
+
+    # ── Time sync (PX4: Time Sync) ─────────────────────────────────────────────
+    timesync_warn_us: 500           # warn  if |clock offset| > 500 µs
+    timesync_error_us: 2000         # error if |clock offset| > 2 ms
+
+    # ── Battery (PX4: Battery Health) — 4S LiPo defaults ──────────────────────
+    battery_warn_v: 14.4            # warn  if voltage   < 14.4 V
+    battery_error_v: 13.6           # error if voltage   < 13.6 V
+    battery_warn_pct: 0.25          # warn  if remaining < 25 %
+    battery_error_pct: 0.10         # error if remaining < 10 %
+
+    # ── IMU vibration (PX4: IMU Vibration) ────────────────────────────────────
+    vibration_warn_m2s4: 4.0        # warn  if max accel variance > 4.0 m²/s⁴
+    vibration_error_m2s4: 9.0       # error if max accel variance > 9.0 m²/s⁴
+
+    # ── EKF (PX4: EKF Health) ─────────────────────────────────────────────────
+    ekf_horiz_accuracy_warn_m: 5.0  # warn  if horizontal accuracy > 5 m
+
+    # ── High-rate topics (IMU / AngVel / LocalPos / EKF) ──────────────────────
+    rate_min_ratio: 0.5             # warn  if actual_hz < ratio * expected_hz
+
+    # ── IMU vibration — VehicleImuStatus primary path ─────────────────────────
+    imu_accel_vib_warn_ms2: 0.35    # warn  if accel_vibration_metric > 0.35 m/s²
+    imu_accel_vib_error_ms2: 0.70   # error if accel_vibration_metric > 0.70 m/s²
+    imu_gyro_vib_warn_rads: 0.07    # warn  if gyro_vibration_metric  > 0.07 rad/s
+    imu_gyro_vib_error_rads: 0.15   # error if gyro_vibration_metric  > 0.15 rad/s
+
+    # ── Battery cell balance ───────────────────────────────────────────────────
+    battery_cell_delta_warn_v: 0.20 # warn  if max_cell_voltage_delta > 0.20 V

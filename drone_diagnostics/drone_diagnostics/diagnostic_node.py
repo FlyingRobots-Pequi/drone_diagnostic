@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real-time drone diagnostic node for PX4 — /fmu/out telemetry only."""
 
+import math
 import time
 from collections import deque
 from typing import Optional
@@ -14,10 +15,12 @@ from px4_msgs.msg import (
     BatteryStatus,
     Cpuload,
     EstimatorStatus,
+    EstimatorStatusFlags,
     FailsafeFlags,
     SensorCombined,
     TimesyncStatus,
     VehicleAngularVelocity,
+    VehicleImuStatus,
     VehicleLandDetected,
     VehicleLocalPosition,
     VehicleStatus,
@@ -51,12 +54,51 @@ NAV_STATE = {
 }
 ARMING_STATE = {1: "DISARMED", 2: "ARMED"}
 
-# EstimatorStatus.innovation_check_flags bit meanings
-INNOV_BITS = [
-    "vel_horiz", "vel_vert", "pos_horiz", "pos_vert",
-    "magnetometer", "heading", "airspeed", "beta",
-    "hagl", "optflow_x", "optflow_y", "gravity",
+# EstimatorStatusFlags.fs_* fault fields — any True = numerical error in the filter
+EKF_FAULT_FIELDS = [
+    "fs_bad_mag_x", "fs_bad_mag_y", "fs_bad_mag_z",
+    "fs_bad_hdg", "fs_bad_mag_decl",
+    "fs_bad_airspeed", "fs_bad_sideslip",
+    "fs_bad_optflow_x", "fs_bad_optflow_y",
+    "fs_bad_acc_bias", "fs_bad_acc_vertical", "fs_bad_acc_clipping",
 ]
+
+# EstimatorStatusFlags.reject_* fields — any True = sensor measurement rejected
+EKF_REJECT_FIELDS = [
+    "reject_hor_vel", "reject_ver_vel",
+    "reject_hor_pos", "reject_ver_pos",
+    "reject_yaw", "reject_airspeed", "reject_sideslip",
+    "reject_hagl", "reject_optflow_x", "reject_optflow_y",
+]
+
+# VehicleStatus.failure_detector_status bit definitions (mask, name)
+FAILURE_DETECTOR_BITS = [
+    (1,   "FAILURE_ROLL"),
+    (2,   "FAILURE_PITCH"),
+    (4,   "FAILURE_ALT"),
+    (8,   "FAILURE_EXT"),
+    (16,  "FAILURE_ARM_ESC"),
+    (32,  "FAILURE_BATTERY"),
+    (64,  "FAILURE_IMBALANCED_PROP"),
+    (128, "FAILURE_MOTOR"),
+]
+
+# BatteryStatus.warning enum names (note: 5 is unassigned)
+BATTERY_WARNING_NAMES = {
+    0: "NONE", 1: "LOW", 2: "CRITICAL", 3: "EMERGENCY",
+    4: "FAILED", 6: "UNHEALTHY", 7: "CHARGING",
+}
+
+# BatteryStatus.faults bitmask names (indices 0–10)
+BATTERY_FAULT_NAMES = [
+    "DEEP_DISCHARGE", "SPIKES", "CELL_FAIL", "OVER_CURRENT",
+    "OVER_TEMPERATURE", "UNDER_TEMPERATURE", "INCOMPATIBLE_VOLTAGE",
+    "INCOMPATIBLE_FIRMWARE", "INCOMPATIBLE_MODEL", "HARDWARE_FAILURE",
+    "OVER_TEMPERATURE_2",   # PX4 has two distinct over-temp bits; index 10 reuses the name
+]
+
+# BatteryStatus.warning values that map to ERROR level
+BATTERY_ERROR_WARNINGS = frozenset({2, 3, 4, 6})  # CRITICAL, EMERGENCY, FAILED, UNHEALTHY
 
 # FailsafeFlags fields monitored (any True → ERROR)
 FAILSAFE_FIELDS = [
@@ -121,12 +163,12 @@ class TopicMonitor:
             KeyValue(key="staleness", value=stale),
         ]
 
-    def rate_status(self):
+    def rate_status(self, min_ratio: float = 0.5):
         if not self.is_alive:
             msg = "No messages" if self._last_msg_time is None else f"Stale ({self.staleness_sec:.1f}s)"
             return ERROR, msg
         ratio = self.actual_hz / self.expected_hz if self.expected_hz > 0 else 1.0
-        if ratio < 0.5:
+        if ratio < min_ratio:
             return WARN, f"Rate low: {self.actual_hz:.1f}/{self.expected_hz:.0f} Hz"
         return OK, f"OK @ {self.actual_hz:.1f} Hz"
 
@@ -149,6 +191,31 @@ class DroneDiagnosticNode(Node):
         self.declare_parameter("timesync_warn_us", 500)
         self.declare_parameter("timesync_error_us", 2000)
 
+        # Battery thresholds (4S LiPo defaults)
+        self.declare_parameter("battery_warn_v", 14.4)
+        self.declare_parameter("battery_error_v", 13.6)
+        self.declare_parameter("battery_warn_pct", 0.25)
+        self.declare_parameter("battery_error_pct", 0.10)
+
+        # IMU vibration thresholds (m²/s⁴)
+        self.declare_parameter("vibration_warn_m2s4", 4.0)
+        self.declare_parameter("vibration_error_m2s4", 9.0)
+
+        # EKF horizontal accuracy warn threshold (m)
+        self.declare_parameter("ekf_horiz_accuracy_warn_m", 5.0)
+
+        # Minimum rate ratio before a high-rate topic is WARN (fraction of expected Hz)
+        self.declare_parameter("rate_min_ratio", 0.5)
+
+        # IMU vibration — VehicleImuStatus primary path
+        self.declare_parameter("imu_accel_vib_warn_ms2",  0.35)
+        self.declare_parameter("imu_accel_vib_error_ms2", 0.70)
+        self.declare_parameter("imu_gyro_vib_warn_rads",  0.07)
+        self.declare_parameter("imu_gyro_vib_error_rads", 0.15)
+
+        # Battery cell balance
+        self.declare_parameter("battery_cell_delta_warn_v", 0.20)
+
         ns = self.get_parameter("drone_namespace").get_parameter_value().string_value
         timeout = self.get_parameter("topic_timeout_sec").get_parameter_value().double_value
 
@@ -160,6 +227,8 @@ class DroneDiagnosticNode(Node):
         self._mon_ang_vel = TopicMonitor(f"{ns}/fmu/out/vehicle_angular_velocity", 100.0, timeout)
         self._mon_local_pos = TopicMonitor(f"{ns}/fmu/out/vehicle_local_position", 100.0, timeout)
         self._mon_estimator = TopicMonitor(f"{ns}/fmu/out/estimator_status", 100.0, timeout)
+        self._mon_estimator_flags = TopicMonitor(f"{ns}/fmu/out/estimator_status_flags", 100.0, timeout)
+        self._mon_imu_status = TopicMonitor(f"{ns}/fmu/out/vehicle_imu_status", 100.0, timeout)
 
         # ------------------------------------------------------------------ #
         # Latest message state — fmu/out low-rate status topics              #
@@ -167,6 +236,8 @@ class DroneDiagnosticNode(Node):
 
         self._vehicle_status_msg: Optional[VehicleStatus] = None
         self._estimator_msg: Optional[EstimatorStatus] = None
+        self._estimator_flags_msg: Optional[EstimatorStatusFlags] = None
+        self._imu_status_msg: Optional[VehicleImuStatus] = None
         self._failsafe_msg: Optional[FailsafeFlags] = None
         self._cpuload_msg: Optional[Cpuload] = None
         self._timesync_msg: Optional[TimesyncStatus] = None
@@ -204,6 +275,16 @@ class DroneDiagnosticNode(Node):
                                  self._cb_land_detected, QOS_PX4)
         self.create_subscription(BatteryStatus, f"{ns}/fmu/out/battery_status",
                                  self._cb_battery, QOS_PX4)
+
+        # EstimatorStatusFlags — authoritative per-boolean EKF state (100 Hz)
+        self.create_subscription(EstimatorStatusFlags,
+                                 f"{ns}/fmu/out/estimator_status_flags",
+                                 self._cb_estimator_flags, QOS_PX4)
+
+        # VehicleImuStatus — PX4-computed vibration metrics (100 Hz, optional)
+        self.create_subscription(VehicleImuStatus,
+                                 f"{ns}/fmu/out/vehicle_imu_status",
+                                 self._cb_imu_status, QOS_PX4)
 
         # ------------------------------------------------------------------ #
         # Publisher + timer                                                    #
@@ -251,6 +332,14 @@ class DroneDiagnosticNode(Node):
     def _cb_battery(self, msg: BatteryStatus) -> None:
         self._battery_msg = msg
 
+    def _cb_estimator_flags(self, msg: EstimatorStatusFlags) -> None:
+        self._mon_estimator_flags.on_message()
+        self._estimator_flags_msg = msg
+
+    def _cb_imu_status(self, msg: VehicleImuStatus) -> None:
+        self._mon_imu_status.on_message()
+        self._imu_status_msg = msg
+
     # ------------------------------------------------------------------ #
     # Diagnostic builders — fmu/out telemetry                             #
     # ------------------------------------------------------------------ #
@@ -258,9 +347,13 @@ class DroneDiagnosticNode(Node):
     def _diag_vehicle_status(self) -> DiagnosticStatus:
         # HEALTH CRITERIA — PX4: Vehicle Status (/fmu/out/vehicle_status)
         # ─────────────────────────────────────────────────────────────────
-        # OK    : failsafe=False, arming_state ∈ {DISARMED=1, ARMED=2}
+        # OK    : failsafe=False, arming_state ∈ {DISARMED=1, ARMED=2},
+        #         failure_detector_status==0
         # WARN  : arming_state outside {1, 2}  (unexpected/transitional state)
+        #         OR gcs_connection_lost=True  (datalink down, no failsafe yet)
+        #         OR pre_flight_checks_pass=False while ARMED
         # ERROR : failsafe=True
+        #         OR any failure_detector_status bit set
         # NO MSG: ERROR
         # ─────────────────────────────────────────────────────────────────
         if self._vehicle_status_msg is None:
@@ -278,10 +371,32 @@ class DroneDiagnosticNode(Node):
         elif s.arming_state not in (1, 2):
             level = WARN
 
+        # Failure detector bitmask — identifies which failure triggered
+        fd = s.failure_detector_status
+        active_failures = [name for mask, name in FAILURE_DETECTOR_BITS if fd & mask]
+        if active_failures and level != ERROR:
+            level = ERROR
+            msg = f"Failure detector: {','.join(active_failures)}"
+
+        # GCS link loss — WARN (don't escalate past ERROR)
+        if s.gcs_connection_lost and level == OK:
+            level = WARN
+            msg = f"GCS link lost (x{s.gcs_connection_lost_counter})"
+
+        # Pre-flight checks failing while armed
+        if not s.pre_flight_checks_pass and s.arming_state == 2 and level == OK:
+            level = WARN
+            msg = "Pre-flight checks failing while ARMED"
+
         kvs = [
             KeyValue(key="arming_state", value=arm),
             KeyValue(key="nav_state", value=nav),
             KeyValue(key="failsafe", value=str(s.failsafe)),
+            KeyValue(key="failure_detector", value=hex(fd)),
+            KeyValue(key="active_failures", value=",".join(active_failures) or "none"),
+            KeyValue(key="pre_flight_checks_pass", value=str(s.pre_flight_checks_pass)),
+            KeyValue(key="gcs_connection_lost", value=str(s.gcs_connection_lost)),
+            KeyValue(key="gcs_lost_count", value=str(s.gcs_connection_lost_counter)),
         ]
         return DiagnosticStatus(level=level, name="PX4: Vehicle Status",
                                 message=msg, hardware_id="px4_fmu", values=kvs)
@@ -305,7 +420,7 @@ class DroneDiagnosticNode(Node):
             return DiagnosticStatus(level=WARN, name="PX4: Failsafe Flags",
                                     message="No messages received", hardware_id="px4_fmu")
         f = self._failsafe_msg
-        active = [field for field in FAILSAFE_FIELDS if getattr(f, field, False)]
+        active = [field for field in FAILSAFE_FIELDS if getattr(f, field)]
         level = ERROR if active else OK
         msg = f"Active: {','.join(active)}" if active else "No active failsafes"
         kvs = [KeyValue(key=field, value="TRUE") for field in active]
@@ -399,11 +514,23 @@ class DroneDiagnosticNode(Node):
         # HEALTH CRITERIA — PX4: Battery Health (/fmu/out/battery_status)
         # 4S LiPo reference: full ≈ 16.8 V, nominal ≈ 14.8 V
         # ─────────────────────────────────────────────────────────────────
-        # OK    : voltage ≥ 14.4 V  AND  remaining ≥ 25 %
-        # WARN  : voltage < 14.4 V   OR  remaining < 25 %
-        # ERROR : voltage < 13.6 V   OR  remaining < 10 %
+        # Level determined by PX4's own battery state machine first, then
+        # voltage/remaining thresholds as a secondary guard.
+        #
+        # OK    : warning==NONE AND voltage ≥ battery_warn_v AND remaining ≥ battery_warn_pct
+        # WARN  : warning==LOW OR warning==CHARGING
+        #         OR voltage < battery_warn_v  OR  remaining < battery_warn_pct
+        #         OR max_cell_voltage_delta > battery_cell_delta_warn_v (0.20 V)
+        # ERROR : warning ∈ {CRITICAL, EMERGENCY, FAILED, UNHEALTHY}
+        #         OR voltage < battery_error_v  OR  remaining < battery_error_pct
+        #         OR any faults bitmask bit set
         # NO MSG: WARN
         # ─────────────────────────────────────────────────────────────────
+        warn_v = self.get_parameter("battery_warn_v").get_parameter_value().double_value
+        error_v = self.get_parameter("battery_error_v").get_parameter_value().double_value
+        warn_pct = self.get_parameter("battery_warn_pct").get_parameter_value().double_value
+        error_pct = self.get_parameter("battery_error_pct").get_parameter_value().double_value
+        cell_delta_warn = self.get_parameter("battery_cell_delta_warn_v").get_parameter_value().double_value
         if self._battery_msg is None:
             return DiagnosticStatus(level=WARN, name="PX4: Battery Health",
                                     message="No messages received", hardware_id="px4_fmu")
@@ -412,21 +539,47 @@ class DroneDiagnosticNode(Node):
         remaining = b.remaining  # 0.0–1.0
         remaining_pct = remaining * 100.0
 
-        if voltage < 13.6 or remaining < 0.10:
+        # PX4 battery state machine takes precedence
+        px4_warn = b.warning
+        warning_name = BATTERY_WARNING_NAMES.get(px4_warn, f"UNKNOWN({px4_warn})")
+        if px4_warn in BATTERY_ERROR_WARNINGS:
+            level = ERROR
+            msg = f"Battery {warning_name}: {voltage:.2f}V {remaining_pct:.0f}%"
+        elif px4_warn == 1:               # LOW
+            level = WARN
+            msg = f"Battery LOW: {voltage:.2f}V {remaining_pct:.0f}%"
+        elif voltage < error_v or remaining < error_pct:
             level = ERROR
             msg = f"CRITICAL: {voltage:.2f}V {remaining_pct:.0f}%"
-        elif voltage < 14.4 or remaining < 0.25:
+        elif voltage < warn_v or remaining < warn_pct:
             level = WARN
             msg = f"Low battery: {voltage:.2f}V {remaining_pct:.0f}%"
         else:
             level = OK
             msg = f"{voltage:.2f}V {remaining_pct:.0f}% ({b.current_a:.1f}A)"
 
+        # Fault bitmask — smart battery reported faults
+        active_faults = [BATTERY_FAULT_NAMES[i] for i in range(len(BATTERY_FAULT_NAMES)) if (b.faults >> i) & 1]
+        if active_faults and level != ERROR:
+            level = ERROR
+            msg = f"Battery faults: {','.join(active_faults)}"
+
+        # Cell imbalance
+        cell_delta = b.max_cell_voltage_delta
+        if not math.isnan(cell_delta) and cell_delta > cell_delta_warn and level == OK:
+            level = WARN
+            msg = f"Cell imbalance: \u0394{cell_delta:.3f}V"
+
         kvs = [
             KeyValue(key="voltage_v", value=f"{voltage:.3f}"),
             KeyValue(key="remaining_pct", value=f"{remaining_pct:.1f}"),
             KeyValue(key="current_a", value=f"{b.current_a:.2f}"),
             KeyValue(key="discharged_mah", value=f"{b.discharged_mah:.0f}"),
+            KeyValue(key="px4_warning", value=warning_name),
+            KeyValue(key="faults", value=",".join(active_faults) or "none"),
+            KeyValue(key="cell_delta_v", value="NaN" if math.isnan(cell_delta) else f"{cell_delta:.3f}"),
+            KeyValue(key="temperature_c", value="NaN" if math.isnan(b.temperature) else f"{b.temperature:.1f}"),
+            KeyValue(key="time_remaining_s", value="NaN" if math.isnan(b.time_remaining_s) else f"{b.time_remaining_s:.0f}"),
         ]
         return DiagnosticStatus(level=level, name="PX4: Battery Health",
                                 message=msg, hardware_id="px4_fmu", values=kvs)
@@ -434,22 +587,24 @@ class DroneDiagnosticNode(Node):
     def _diag_imu(self) -> DiagnosticStatus:
         # HEALTH CRITERIA — PX4: IMU (/fmu/out/sensor_combined)
         # ─────────────────────────────────────────────────────────────────
-        # OK    : topic alive AND rate ≥ 50 Hz  (≥ 50 % of 100 Hz expected)
-        # WARN  : topic alive AND rate < 50 Hz
+        # OK    : topic alive AND rate ≥ rate_min_ratio * 100 Hz
+        # WARN  : topic alive AND rate < rate_min_ratio * 100 Hz
         # ERROR : topic stale (> topic_timeout_sec) or never received
         # ─────────────────────────────────────────────────────────────────
-        level, msg = self._mon_imu.rate_status()
+        min_ratio = self.get_parameter("rate_min_ratio").get_parameter_value().double_value
+        level, msg = self._mon_imu.rate_status(min_ratio)
         return DiagnosticStatus(level=level, name="PX4: IMU (sensor_combined)",
                                 message=msg, hardware_id="px4_fmu", values=self._mon_imu.base_kvs())
 
     def _diag_ang_vel(self) -> DiagnosticStatus:
         # HEALTH CRITERIA — PX4: Angular Velocity (/fmu/out/vehicle_angular_velocity)
         # ─────────────────────────────────────────────────────────────────
-        # OK    : topic alive AND rate ≥ 50 Hz  (≥ 50 % of 100 Hz expected)
-        # WARN  : topic alive AND rate < 50 Hz
+        # OK    : topic alive AND rate ≥ rate_min_ratio * 100 Hz
+        # WARN  : topic alive AND rate < rate_min_ratio * 100 Hz
         # ERROR : topic stale (> topic_timeout_sec) or never received
         # ─────────────────────────────────────────────────────────────────
-        level, msg = self._mon_ang_vel.rate_status()
+        min_ratio = self.get_parameter("rate_min_ratio").get_parameter_value().double_value
+        level, msg = self._mon_ang_vel.rate_status(min_ratio)
         return DiagnosticStatus(level=level, name="PX4: Angular Velocity",
                                 message=msg, hardware_id="px4_fmu", values=self._mon_ang_vel.base_kvs())
 
@@ -460,7 +615,8 @@ class DroneDiagnosticNode(Node):
         # WARN  : topic alive AND z_valid=False  (altitude unreliable)
         # ERROR : topic stale/absent  OR  xy_valid=False  (no horizontal fix)
         # ─────────────────────────────────────────────────────────────────
-        level, msg = self._mon_local_pos.rate_status()
+        min_ratio = self.get_parameter("rate_min_ratio").get_parameter_value().double_value
+        level, msg = self._mon_local_pos.rate_status(min_ratio)
         kvs = self._mon_local_pos.base_kvs()
         if self._local_pos_msg is not None and self._mon_local_pos.is_alive:
             p = self._local_pos_msg
@@ -481,68 +637,110 @@ class DroneDiagnosticNode(Node):
     def _diag_ekf_health(self) -> DiagnosticStatus:
         # HEALTH CRITERIA — PX4: EKF Health (/fmu/out/estimator_status)
         # ─────────────────────────────────────────────────────────────────
-        # OK    : topic alive, no innovation failures, pos_horiz_accuracy ≤ 5.0 m
-        # WARN  : any innovation_check_flags bit set  OR  pos_horiz_accuracy > 5.0 m
+        # OK    : topic alive AND pos_horiz_accuracy ≤ ekf_horiz_accuracy_warn_m
+        # WARN  : topic alive AND pos_horiz_accuracy > ekf_horiz_accuracy_warn_m
         # ERROR : topic stale or never received
         #
-        # Innovation bits checked (any set → WARN):
-        #   vel_horiz, vel_vert, pos_horiz, pos_vert, magnetometer, heading,
-        #   airspeed, beta, hagl, optflow_x, optflow_y, gravity
+        # Innovation fault details are reported by PX4: EKF Status Flags
+        # (estimator_status_flags) using the authoritative per-boolean fields.
         # ─────────────────────────────────────────────────────────────────
-        level, msg = self._mon_estimator.rate_status()
+        min_ratio = self.get_parameter("rate_min_ratio").get_parameter_value().double_value
+        level, msg = self._mon_estimator.rate_status(min_ratio)
         kvs = self._mon_estimator.base_kvs()
         if self._estimator_msg is not None and self._mon_estimator.is_alive:
             e = self._estimator_msg
-            innov_flags = getattr(e, "innovation_check_flags", 0)
-            failed_bits = [INNOV_BITS[i] for i in range(len(INNOV_BITS))
-                           if (innov_flags >> i) & 1]
             kvs += [
                 KeyValue(key="pos_horiz_accuracy_m", value=f"{e.pos_horiz_accuracy:.3f}"),
                 KeyValue(key="pos_vert_accuracy_m", value=f"{e.pos_vert_accuracy:.3f}"),
-                KeyValue(key="innovation_failures", value=",".join(failed_bits) or "none"),
-                KeyValue(key="innovation_fail_count", value=str(len(failed_bits))),
             ]
-            if failed_bits and level == OK:
-                level = WARN
-                msg = f"Innovation failures: {','.join(failed_bits)}"
-            if e.pos_horiz_accuracy > 5.0 and level == OK:
+            ekf_acc_warn = self.get_parameter("ekf_horiz_accuracy_warn_m").get_parameter_value().double_value
+            if e.pos_horiz_accuracy > ekf_acc_warn and level == OK:
                 level = WARN
                 msg = f"Low horizontal accuracy ({e.pos_horiz_accuracy:.1f}m)"
         return DiagnosticStatus(level=level, name="PX4: EKF Health",
                                 message=msg, hardware_id="px4_fmu", values=kvs)
 
     def _diag_imu_vibration(self) -> DiagnosticStatus:
-        # HEALTH CRITERIA — PX4: IMU Vibration (derived from /fmu/out/sensor_combined)
-        # Uses last 30 accelerometer samples; variance computed per axis.
+        # HEALTH CRITERIA — PX4: IMU Vibration
         # ─────────────────────────────────────────────────────────────────
-        # OK    : max(accel variance x,y,z) ≤ 4.0 m²/s⁴
-        # WARN  : max variance > 4.0 m²/s⁴  (elevated vibration)
-        # ERROR : max variance > 9.0 m²/s⁴  (high vibration — likely mechanical issue)
-        # WARN  : < 10 samples collected yet  (insufficient window)
+        # PRIMARY path (vehicle_imu_status alive):
+        #   Uses PX4-computed accel_vibration_metric (m/s²) and
+        #   gyro_vibration_metric (rad/s). Also reports clipping counts,
+        #   error counts, and temperatures.
+        #   OK    : accel ≤ imu_accel_vib_warn_ms2 AND gyro ≤ imu_gyro_vib_warn_rads
+        #   WARN  : either metric exceeds warn threshold
+        #   ERROR : either metric exceeds error threshold
+        #
+        # FALLBACK path (vehicle_imu_status absent):
+        #   Variance of last 30 sensor_combined accel samples (existing logic).
+        #   OK    : max variance ≤ vibration_warn_m2s4
+        #   WARN  : max variance > vibration_warn_m2s4
+        #   ERROR : max variance > vibration_error_m2s4
         # ─────────────────────────────────────────────────────────────────
+        if self._mon_imu_status.is_alive and self._imu_status_msg is not None:
+            # PRIMARY PATH — PX4-native metrics
+            a_warn  = self.get_parameter("imu_accel_vib_warn_ms2").get_parameter_value().double_value
+            a_error = self.get_parameter("imu_accel_vib_error_ms2").get_parameter_value().double_value
+            g_warn  = self.get_parameter("imu_gyro_vib_warn_rads").get_parameter_value().double_value
+            g_error = self.get_parameter("imu_gyro_vib_error_rads").get_parameter_value().double_value
+            s = self._imu_status_msg
+            a = s.accel_vibration_metric
+            g = s.gyro_vibration_metric
+            if a > a_error or g > g_error:
+                level = ERROR
+                msg = f"High vib: accel={a:.3f}m/s² gyro={g:.3f}rad/s"
+            elif a > a_warn or g > g_warn:
+                level = WARN
+                msg = f"Elevated vib: accel={a:.3f}m/s² gyro={g:.3f}rad/s"
+            else:
+                level = OK
+                msg = f"OK accel={a:.3f}m/s² gyro={g:.3f}rad/s"
+            kvs = [
+                KeyValue(key="accel_vibration_metric_ms2", value=f"{a:.4f}"),
+                KeyValue(key="gyro_vibration_metric_rads", value=f"{g:.4f}"),
+                KeyValue(key="delta_angle_coning_rad2", value=f"{s.delta_angle_coning_metric:.6f}"),
+                KeyValue(key="accel_clipping_x", value=str(s.accel_clipping[0])),
+                KeyValue(key="accel_clipping_y", value=str(s.accel_clipping[1])),
+                KeyValue(key="accel_clipping_z", value=str(s.accel_clipping[2])),
+                KeyValue(key="gyro_clipping_x",  value=str(s.gyro_clipping[0])),
+                KeyValue(key="gyro_clipping_y",  value=str(s.gyro_clipping[1])),
+                KeyValue(key="gyro_clipping_z",  value=str(s.gyro_clipping[2])),
+                KeyValue(key="accel_error_count", value=str(s.accel_error_count)),
+                KeyValue(key="gyro_error_count",  value=str(s.gyro_error_count)),
+                KeyValue(key="temperature_accel_c", value=f"{s.temperature_accel:.1f}"),
+                KeyValue(key="temperature_gyro_c",  value=f"{s.temperature_gyro:.1f}"),
+                KeyValue(key="accel_rate_hz", value=f"{s.accel_rate_hz:.1f}"),
+                KeyValue(key="source", value="vehicle_imu_status"),
+            ]
+            return DiagnosticStatus(level=level, name="PX4: IMU Vibration",
+                                    message=msg, hardware_id="px4_fmu", values=kvs)
+
+        # FALLBACK PATH — accel variance from sensor_combined samples
+        vib_warn = self.get_parameter("vibration_warn_m2s4").get_parameter_value().double_value
+        vib_error = self.get_parameter("vibration_error_m2s4").get_parameter_value().double_value
         if len(self._accel_samples) < 10:
             return DiagnosticStatus(
                 level=WARN, name="PX4: IMU Vibration",
                 message="Insufficient samples", hardware_id="px4_fmu",
-                values=[KeyValue(key="sample_count", value=str(len(self._accel_samples)))]
+                values=[
+                    KeyValue(key="sample_count", value=str(len(self._accel_samples))),
+                    KeyValue(key="source", value="variance_fallback"),
+                ]
             )
-        samples = list(self._accel_samples)
-        n = len(samples)
-        ax = [s[0] for s in samples]
-        ay = [s[1] for s in samples]
-        az = [s[2] for s in samples]
+        n = len(self._accel_samples)
+        ax, ay, az = zip(*self._accel_samples)
 
-        def variance(vals: list[float]) -> float:
+        def variance(vals: tuple[float, ...]) -> float:
             mean = sum(vals) / len(vals)
             return sum((v - mean) ** 2 for v in vals) / len(vals)
 
         vx, vy, vz = variance(ax), variance(ay), variance(az)
         max_var = max(vx, vy, vz)
 
-        if max_var > 9.0:
+        if max_var > vib_error:
             level = ERROR
             msg = f"High vibration: {max_var:.2f} m²/s⁴"
-        elif max_var > 4.0:
+        elif max_var > vib_warn:
             level = WARN
             msg = f"Elevated vibration: {max_var:.2f} m²/s⁴"
         else:
@@ -550,13 +748,75 @@ class DroneDiagnosticNode(Node):
             msg = f"OK ({max_var:.2f} m²/s⁴)"
 
         kvs = [
-            KeyValue(key="accel_var_x", value=f"{vx:.4f}"),
-            KeyValue(key="accel_var_y", value=f"{vy:.4f}"),
-            KeyValue(key="accel_var_z", value=f"{vz:.4f}"),
+            KeyValue(key="accel_var_x",   value=f"{vx:.4f}"),
+            KeyValue(key="accel_var_y",   value=f"{vy:.4f}"),
+            KeyValue(key="accel_var_z",   value=f"{vz:.4f}"),
             KeyValue(key="accel_var_max", value=f"{max_var:.4f}"),
-            KeyValue(key="sample_count", value=str(n)),
+            KeyValue(key="sample_count",  value=str(n)),
+            KeyValue(key="source",        value="variance_fallback"),
         ]
         return DiagnosticStatus(level=level, name="PX4: IMU Vibration",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_ekf_status_flags(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: EKF Status Flags (/fmu/out/estimator_status_flags)
+        # ─────────────────────────────────────────────────────────────────
+        # Authoritative per-boolean EKF state from PX4. Unlike EstimatorStatus,
+        # field layout is stable across PX4 minor versions.
+        #
+        # OK    : all fs_* False  AND  all reject_* False
+        #         AND cs_tilt_align=True AND cs_yaw_align=True
+        #         AND cs_inertial_dead_reckoning=False
+        # WARN  : any reject_* True  (measurement rejected, filter degraded)
+        #         OR cs_tilt_align=False OR cs_yaw_align=False (not yet aligned)
+        #         OR cs_inertial_dead_reckoning=True (no external position constraint)
+        # ERROR : any fs_* True  (numerical error in the filter math)
+        # NO MSG: WARN
+        # ─────────────────────────────────────────────────────────────────
+        if self._estimator_flags_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: EKF Status Flags",
+                                    message="No messages received", hardware_id="px4_fmu")
+        f = self._estimator_flags_msg
+
+        faults  = [field for field in EKF_FAULT_FIELDS  if getattr(f, field)]
+        rejects = [field for field in EKF_REJECT_FIELDS if getattr(f, field)]
+
+        warn_conditions = (
+            (["tilt_not_aligned"]        if not f.cs_tilt_align             else []) +
+            (["yaw_not_aligned"]         if not f.cs_yaw_align              else []) +
+            (["inertial_dead_reckoning"] if f.cs_inertial_dead_reckoning    else [])
+        )
+
+        if faults:
+            level = ERROR
+            msg = f"EKF faults: {','.join(faults)}"
+        elif rejects:
+            level = WARN
+            msg = f"Innovation rejected: {','.join(rejects)}"
+        elif warn_conditions:
+            level = WARN
+            msg = f"EKF warnings: {','.join(warn_conditions)}"
+        else:
+            gps_str  = "fusing" if f.cs_gps      else "off"
+            baro_str = "fusing" if f.cs_baro_hgt  else "off"
+            level = OK
+            msg = f"OK (GPS={gps_str}, baro={baro_str})"
+
+        kvs = [
+            KeyValue(key="cs_tilt_align",             value=str(f.cs_tilt_align)),
+            KeyValue(key="cs_yaw_align",              value=str(f.cs_yaw_align)),
+            KeyValue(key="cs_gps",                    value=str(f.cs_gps)),
+            KeyValue(key="cs_baro_hgt",               value=str(f.cs_baro_hgt)),
+            KeyValue(key="cs_mag",                    value=str(f.cs_mag)),
+            KeyValue(key="cs_inertial_dead_reckoning",value=str(f.cs_inertial_dead_reckoning)),
+            KeyValue(key="cs_wind_dead_reckoning",    value=str(f.cs_wind_dead_reckoning)),
+            KeyValue(key="cs_mag_fault",              value=str(f.cs_mag_fault)),
+            KeyValue(key="active_faults",             value=",".join(faults)  or "none"),
+            KeyValue(key="active_rejects",            value=",".join(rejects) or "none"),
+            KeyValue(key="fault_status_changes",      value=str(f.fault_status_changes)),
+            KeyValue(key="innovation_fault_status_changes", value=str(f.innovation_fault_status_changes)),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: EKF Status Flags",
                                 message=msg, hardware_id="px4_fmu", values=kvs)
 
     # ------------------------------------------------------------------ #
@@ -578,6 +838,7 @@ class DroneDiagnosticNode(Node):
             self._diag_local_position(),
             self._diag_ekf_health(),
             self._diag_imu_vibration(),
+            self._diag_ekf_status_flags(),
         ]
         self._diag_pub.publish(arr)
 
