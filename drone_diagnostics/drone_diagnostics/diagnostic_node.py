@@ -14,12 +14,20 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from px4_msgs.msg import (
     BatteryStatus,
     Cpuload,
+    EscStatus,
     EstimatorStatus,
     EstimatorStatusFlags,
     FailsafeFlags,
+    GeofenceResult,
+    HomePosition,
+    RcChannels,
     SensorCombined,
+    SensorGps,
+    TelemetryStatus,
     TimesyncStatus,
+    VehicleAirData,
     VehicleAngularVelocity,
+    VehicleAttitude,
     VehicleImuStatus,
     VehicleLandDetected,
     VehicleLocalPosition,
@@ -99,6 +107,24 @@ BATTERY_FAULT_NAMES = [
 
 # BatteryStatus.warning values that map to ERROR level
 BATTERY_ERROR_WARNINGS = frozenset({2, 3, 4, 6})  # CRITICAL, EMERGENCY, FAILED, UNHEALTHY
+
+GPS_FIX_TYPE_NAMES = {
+    0: "NO_FIX", 1: "NO_FIX", 2: "2D_FIX", 3: "3D_FIX",
+    4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED",
+}
+
+# EscReport.failures bitmask (bit index → name, value = 1 << index)
+ESC_FAILURE_BITS = [
+    (1 << 0, "OVER_CURRENT"),       (1 << 1, "OVER_VOLTAGE"),
+    (1 << 2, "MOTOR_OVER_TEMP"),    (1 << 3, "OVER_RPM"),
+    (1 << 4, "INCONSISTENT_CMD"),   (1 << 5, "MOTOR_STUCK"),
+    (1 << 6, "GENERIC"),            (1 << 7, "MOTOR_WARN_TEMP"),
+    (1 << 8, "WARN_ESC_TEMP"),      (1 << 9, "OVER_ESC_TEMP"),
+]
+
+GEOFENCE_ACTION_NAMES = {
+    0: "NONE", 1: "WARN", 2: "HOLD", 3: "RTL", 4: "TERMINATE", 5: "LAND",
+}
 
 # FailsafeFlags fields monitored (any True → ERROR)
 FAILSAFE_FIELDS = [
@@ -216,6 +242,50 @@ class DroneDiagnosticNode(Node):
         # Battery cell balance
         self.declare_parameter("battery_cell_delta_warn_v", 0.20)
 
+        # ── Enable flags — existing checks ──────────────────────────────────
+        self.declare_parameter("enable_vehicle_status",   True)
+        self.declare_parameter("enable_failsafe",         True)
+        self.declare_parameter("enable_land_detected",    True)
+        self.declare_parameter("enable_cpuload",          True)
+        self.declare_parameter("enable_timesync",         True)
+        self.declare_parameter("enable_battery",          True)
+        self.declare_parameter("enable_imu",              True)
+        self.declare_parameter("enable_angular_velocity", True)
+        self.declare_parameter("enable_local_position",   True)
+        self.declare_parameter("enable_ekf_health",       True)
+        self.declare_parameter("enable_imu_vibration",    True)
+        self.declare_parameter("enable_ekf_status_flags", True)
+
+        # ── Enable flags — new checks ────────────────────────────────────────
+        self.declare_parameter("enable_gps",              True)
+        self.declare_parameter("enable_rc_link",          True)
+        self.declare_parameter("enable_attitude",         True)
+        self.declare_parameter("enable_esc_health",       True)
+        self.declare_parameter("enable_telemetry_link",   True)
+        self.declare_parameter("enable_barometer",        True)
+        self.declare_parameter("enable_home_position",    True)
+        self.declare_parameter("enable_geofence",         True)
+
+        # ── GPS thresholds ───────────────────────────────────────────────────
+        self.declare_parameter("gps_fix_type_warn",    3)
+        self.declare_parameter("gps_fix_type_error",   2)
+        self.declare_parameter("gps_hdop_warn",        2.0)
+        self.declare_parameter("gps_hdop_error",       5.0)
+        self.declare_parameter("gps_satellites_warn",  6)
+        self.declare_parameter("gps_satellites_error", 4)
+
+        # ── RC Link thresholds ───────────────────────────────────────────────
+        self.declare_parameter("rc_rssi_warn",  30)
+        self.declare_parameter("rc_rssi_error", 10)
+
+        # ── ESC Health thresholds ────────────────────────────────────────────
+        self.declare_parameter("esc_temp_warn_c",  70.0)
+        self.declare_parameter("esc_temp_error_c", 85.0)
+
+        # ── Barometer plausibility bounds (Pa) ───────────────────────────────
+        self.declare_parameter("baro_pressure_min_pa", 30000.0)
+        self.declare_parameter("baro_pressure_max_pa", 110000.0)
+
         ns = self.get_parameter("drone_namespace").get_parameter_value().string_value
         timeout = self.get_parameter("topic_timeout_sec").get_parameter_value().double_value
 
@@ -229,6 +299,7 @@ class DroneDiagnosticNode(Node):
         self._mon_estimator = TopicMonitor(f"{ns}/fmu/out/estimator_status", 100.0, timeout)
         self._mon_estimator_flags = TopicMonitor(f"{ns}/fmu/out/estimator_status_flags", 100.0, timeout)
         self._mon_imu_status = TopicMonitor(f"{ns}/fmu/out/vehicle_imu_status", 100.0, timeout)
+        self._mon_gps = TopicMonitor(f"{ns}/fmu/out/sensor_gps", 5.0, timeout * 3)
 
         # ------------------------------------------------------------------ #
         # Latest message state — fmu/out low-rate status topics              #
@@ -244,6 +315,16 @@ class DroneDiagnosticNode(Node):
         self._land_detected_msg: Optional[VehicleLandDetected] = None
         self._local_pos_msg: Optional[VehicleLocalPosition] = None
         self._battery_msg: Optional[BatteryStatus] = None
+
+        self._attitude_msg: Optional[VehicleAttitude] = None
+        self._gps_msg: Optional[SensorGps] = None
+        self._esc_status_msg: Optional[EscStatus] = None
+        self._rc_channels_msg: Optional[RcChannels] = None
+        self._telemetry_status_msg: Optional[TelemetryStatus] = None
+        self._air_data_msg: Optional[VehicleAirData] = None
+        self._geofence_result_msg: Optional[GeofenceResult] = None
+        self._home_position_msg: Optional[HomePosition] = None
+        self._prev_q_reset_counter: int = -1  # -1 = first message not yet seen
 
         # Accel samples for vibration analysis (last 30 at 100 Hz ≈ 0.3 s window)
         self._accel_samples: deque[tuple[float, float, float]] = deque(maxlen=30)
@@ -285,6 +366,24 @@ class DroneDiagnosticNode(Node):
         self.create_subscription(VehicleImuStatus,
                                  f"{ns}/fmu/out/vehicle_imu_status",
                                  self._cb_imu_status, QOS_PX4)
+
+        # New low-rate status topics
+        self.create_subscription(VehicleAttitude, f"{ns}/fmu/out/vehicle_attitude",
+                                 self._cb_attitude, QOS_PX4)
+        self.create_subscription(SensorGps, f"{ns}/fmu/out/sensor_gps",
+                                 self._cb_gps, QOS_PX4)
+        self.create_subscription(EscStatus, f"{ns}/fmu/out/esc_status",
+                                 self._cb_esc_status, QOS_PX4)
+        self.create_subscription(RcChannels, f"{ns}/fmu/out/rc_channels",
+                                 self._cb_rc_channels, QOS_PX4)
+        self.create_subscription(TelemetryStatus, f"{ns}/fmu/out/telemetry_status",
+                                 self._cb_telemetry_status, QOS_PX4)
+        self.create_subscription(VehicleAirData, f"{ns}/fmu/out/vehicle_air_data",
+                                 self._cb_air_data, QOS_PX4)
+        self.create_subscription(GeofenceResult, f"{ns}/fmu/out/geofence_result",
+                                 self._cb_geofence_result, QOS_PX4)
+        self.create_subscription(HomePosition, f"{ns}/fmu/out/home_position",
+                                 self._cb_home_position, QOS_PX4)
 
         # ------------------------------------------------------------------ #
         # Publisher + timer                                                    #
@@ -339,6 +438,31 @@ class DroneDiagnosticNode(Node):
     def _cb_imu_status(self, msg: VehicleImuStatus) -> None:
         self._mon_imu_status.on_message()
         self._imu_status_msg = msg
+
+    def _cb_attitude(self, msg: VehicleAttitude) -> None:
+        self._attitude_msg = msg
+
+    def _cb_gps(self, msg: SensorGps) -> None:
+        self._mon_gps.on_message()
+        self._gps_msg = msg
+
+    def _cb_esc_status(self, msg: EscStatus) -> None:
+        self._esc_status_msg = msg
+
+    def _cb_rc_channels(self, msg: RcChannels) -> None:
+        self._rc_channels_msg = msg
+
+    def _cb_telemetry_status(self, msg: TelemetryStatus) -> None:
+        self._telemetry_status_msg = msg
+
+    def _cb_air_data(self, msg: VehicleAirData) -> None:
+        self._air_data_msg = msg
+
+    def _cb_geofence_result(self, msg: GeofenceResult) -> None:
+        self._geofence_result_msg = msg
+
+    def _cb_home_position(self, msg: HomePosition) -> None:
+        self._home_position_msg = msg
 
     # ------------------------------------------------------------------ #
     # Diagnostic builders — fmu/out telemetry                             #
@@ -819,27 +943,377 @@ class DroneDiagnosticNode(Node):
         return DiagnosticStatus(level=level, name="PX4: EKF Status Flags",
                                 message=msg, hardware_id="px4_fmu", values=kvs)
 
+    def _diag_gps(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: GPS Quality (/fmu/out/sensor_gps)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : fix_type >= gps_fix_type_warn(3) AND hdop <= gps_hdop_warn(2.0)
+        #         AND satellites_used >= gps_satellites_warn(6) AND jamming_indicator==0
+        # WARN  : any warn threshold exceeded OR jamming_indicator > 0
+        # ERROR : any error threshold exceeded OR topic stale
+        # NO MSG: WARN
+        # ─────────────────────────────────────────────────────────────────
+        if self._gps_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: GPS Quality",
+                                    message="No messages received", hardware_id="px4_fmu")
+        g = self._gps_msg
+        fix_warn  = self.get_parameter("gps_fix_type_warn").get_parameter_value().integer_value
+        fix_err   = self.get_parameter("gps_fix_type_error").get_parameter_value().integer_value
+        hdop_warn = self.get_parameter("gps_hdop_warn").get_parameter_value().double_value
+        hdop_err  = self.get_parameter("gps_hdop_error").get_parameter_value().double_value
+        sat_warn  = self.get_parameter("gps_satellites_warn").get_parameter_value().integer_value
+        sat_err   = self.get_parameter("gps_satellites_error").get_parameter_value().integer_value
+
+        level = OK
+        problems: list[str] = []
+
+        if not self._mon_gps.is_alive:
+            stale = f"{self._mon_gps.staleness_sec:.1f}s"
+            return DiagnosticStatus(level=ERROR, name="PX4: GPS Quality",
+                                    message=f"Stale ({stale})", hardware_id="px4_fmu",
+                                    values=self._mon_gps.base_kvs())
+
+        if g.fix_type < fix_err or g.hdop > hdop_err or g.satellites_used < sat_err:
+            level = ERROR
+        elif g.fix_type < fix_warn or g.hdop > hdop_warn or g.satellites_used < sat_warn:
+            level = WARN
+
+        if g.fix_type < fix_warn:
+            problems.append(f"fix={GPS_FIX_TYPE_NAMES.get(g.fix_type, str(g.fix_type))}")
+        if g.satellites_used < sat_warn:
+            problems.append(f"sats={g.satellites_used}")
+        if g.hdop > hdop_warn:
+            problems.append(f"hdop={g.hdop:.1f}")
+        if g.jamming_indicator > 0:
+            if level == OK:
+                level = WARN
+            problems.append(f"jamming={g.jamming_indicator}")
+
+        msg = f"OK | {GPS_FIX_TYPE_NAMES.get(g.fix_type, str(g.fix_type))} sats={g.satellites_used} hdop={g.hdop:.1f}" \
+              if not problems else ", ".join(problems)
+
+        kvs = [
+            KeyValue(key="fix_type",          value=GPS_FIX_TYPE_NAMES.get(g.fix_type, str(g.fix_type))),
+            KeyValue(key="satellites_used",   value=str(g.satellites_used)),
+            KeyValue(key="hdop",              value=f"{g.hdop:.2f}"),
+            KeyValue(key="vdop",              value=f"{g.vdop:.2f}"),
+            KeyValue(key="noise_per_ms",      value=str(g.noise_per_ms)),
+            KeyValue(key="jamming_indicator", value=str(g.jamming_indicator)),
+            KeyValue(key="actual_hz",         value=f"{self._mon_gps.actual_hz:.2f}"),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: GPS Quality",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_rc_link(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: RC Link (/fmu/out/rc_channels)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : signal_lost=False AND (rssi==0 OR rssi >= rc_rssi_warn)
+        # WARN  : rssi > 0 AND rssi < rc_rssi_warn (degraded signal)
+        # ERROR : signal_lost=True OR (rssi > 0 AND rssi < rc_rssi_error)
+        # NO MSG: WARN
+        # Note: rssi=0 means RSSI not wired/reported — not a failure
+        #       signal_lost is the authoritative link-loss indicator
+        # ─────────────────────────────────────────────────────────────────
+        if self._rc_channels_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: RC Link",
+                                    message="No messages received", hardware_id="px4_fmu")
+        r = self._rc_channels_msg
+        rssi_warn = self.get_parameter("rc_rssi_warn").get_parameter_value().integer_value
+        rssi_err  = self.get_parameter("rc_rssi_error").get_parameter_value().integer_value
+
+        if r.signal_lost:
+            level = ERROR
+            msg = "SIGNAL LOST"
+        elif r.rssi > 0 and r.rssi < rssi_err:
+            level = ERROR
+            msg = f"RSSI critical: {r.rssi}"
+        elif r.rssi > 0 and r.rssi < rssi_warn:
+            level = WARN
+            msg = f"RSSI low: {r.rssi}"
+        else:
+            level = OK
+            rssi_str = str(r.rssi) if r.rssi > 0 else "N/A"
+            msg = f"OK | channels={r.channel_count} rssi={rssi_str}"
+
+        kvs = [
+            KeyValue(key="signal_lost",      value=str(r.signal_lost)),
+            KeyValue(key="rssi",             value=str(r.rssi)),
+            KeyValue(key="channel_count",    value=str(r.channel_count)),
+            KeyValue(key="frame_drop_count", value=str(r.frame_drop_count)),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: RC Link",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_attitude(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: Attitude (/fmu/out/vehicle_attitude)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : q_reset_counter unchanged AND |quaternion_norm - 1.0| < 0.01
+        # WARN  : q_reset_counter has incremented since last check
+        # ERROR : |quaternion_norm - 1.0| >= 0.05 (filter failure)
+        # NO MSG: WARN
+        # Note: q_reset_counter is uint8 — wrap-around detected
+        # ─────────────────────────────────────────────────────────────────
+        if self._attitude_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: Attitude",
+                                    message="No messages received", hardware_id="px4_fmu")
+        a = self._attitude_msg
+        q = a.q
+        q_norm = math.sqrt(q[0]**2 + q[1]**2 + q[2]**2 + q[3]**2)
+        norm_err = abs(q_norm - 1.0)
+
+        current_reset = int(a.quat_reset_counter)
+        if self._prev_q_reset_counter == -1:
+            reset_delta = 0
+        else:
+            reset_delta = (current_reset - self._prev_q_reset_counter) % 256
+        self._prev_q_reset_counter = current_reset
+
+        if norm_err >= 0.05:
+            level = ERROR
+            msg = f"Invalid quaternion norm={q_norm:.4f}"
+        elif reset_delta > 0:
+            level = WARN
+            msg = f"Attitude reset (x{reset_delta}) norm={q_norm:.4f}"
+        else:
+            level = OK
+            msg = f"OK norm={q_norm:.4f} resets={current_reset}"
+
+        kvs = [
+            KeyValue(key="q_norm",           value=f"{q_norm:.4f}"),
+            KeyValue(key="q_reset_counter",  value=str(current_reset)),
+            KeyValue(key="reset_delta",      value=str(reset_delta)),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: Attitude",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_esc_health(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: ESC Health (/fmu/out/esc_status)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : all active ESC failures==0 AND max_temp <= esc_temp_warn_c
+        # WARN  : any active ESC temp > esc_temp_warn_c
+        # ERROR : any active ESC failures != 0 OR any temp > esc_temp_error_c
+        # NO MSG: WARN
+        # Active ESC = esc_rpm != 0 (ignore zero-RPM slots on a quad)
+        # failures bitmask: bit0=OVER_CURRENT,1=OVER_VOLTAGE,2=MOTOR_OVER_TEMP,3=OVER_RPM
+        # ─────────────────────────────────────────────────────────────────
+        if self._esc_status_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: ESC Health",
+                                    message="No messages received", hardware_id="px4_fmu")
+        e = self._esc_status_msg
+        temp_warn = self.get_parameter("esc_temp_warn_c").get_parameter_value().double_value
+        temp_err  = self.get_parameter("esc_temp_error_c").get_parameter_value().double_value
+
+        level = OK
+        problems: list[str] = []
+        kvs: list[KeyValue] = [
+            KeyValue(key="esc_count",        value=str(e.esc_count)),
+            KeyValue(key="esc_online_flags", value=bin(e.esc_online_flags)),
+        ]
+
+        count = min(e.esc_count, 8)
+        esc_array = list(e.esc)
+        for i in range(count):
+            esc = esc_array[i]
+            online = bool(e.esc_online_flags & (1 << i))
+            if not online:
+                continue
+            temp = esc.esc_temperature
+            failures = esc.failures
+            fault_names = [name for mask, name in ESC_FAILURE_BITS if failures & mask]
+
+            kvs += [
+                KeyValue(key=f"esc{i}_rpm",      value=str(esc.esc_rpm)),
+                KeyValue(key=f"esc{i}_temp_c",   value=f"{temp:.1f}"),
+                KeyValue(key=f"esc{i}_failures",  value=",".join(fault_names) or "none"),
+            ]
+            if fault_names:
+                level = ERROR
+                problems.append(f"ESC{i}:{','.join(fault_names)}")
+            elif temp > temp_err:
+                level = ERROR
+                problems.append(f"ESC{i}_OVERTEMP({temp:.0f}°C)")
+            elif temp > temp_warn and level != ERROR:
+                level = WARN
+                problems.append(f"ESC{i}_HOT({temp:.0f}°C)")
+
+        msg = ", ".join(problems) if problems else f"OK | {count} ESCs"
+        return DiagnosticStatus(level=level, name="PX4: ESC Health",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_telemetry_link(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: Telemetry Link (/fmu/out/telemetry_status)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : heartbeat_type_gcs=True
+        # ERROR : heartbeat_type_gcs=False (GCS not sending MAVLink heartbeats)
+        # NO MSG: WARN
+        # Note: TelemetryStatus has no RSSI field — GCS heartbeat is the only
+        #       authoritative link indicator. tx/rx rates are reported as KVs.
+        # ─────────────────────────────────────────────────────────────────
+        if self._telemetry_status_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: Telemetry Link",
+                                    message="No messages received", hardware_id="px4_fmu")
+        t = self._telemetry_status_msg
+
+        if t.heartbeat_type_gcs:
+            level = OK
+            msg = f"OK | GCS connected tx={t.tx_rate_avg:.0f}B/s rx={t.rx_rate_avg:.0f}B/s"
+        else:
+            level = ERROR
+            msg = "GCS heartbeat lost"
+
+        kvs = [
+            KeyValue(key="heartbeat_type_gcs",   value=str(t.heartbeat_type_gcs)),
+            KeyValue(key="tx_rate_avg_bps",       value=f"{t.tx_rate_avg:.1f}"),
+            KeyValue(key="rx_rate_avg_bps",       value=f"{t.rx_rate_avg:.1f}"),
+            KeyValue(key="rx_message_lost_rate",  value=f"{t.rx_message_lost_rate:.3f}"),
+            KeyValue(key="tx_buffer_overruns",    value=str(t.tx_buffer_overruns)),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: Telemetry Link",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_barometer(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: Barometer (/fmu/out/vehicle_air_data)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : pressure in [baro_pressure_min_pa, baro_pressure_max_pa]
+        #         AND not NaN AND rho > 0
+        # WARN  : pressure within 5% of the plausibility bounds
+        # ERROR : pressure out of bounds OR NaN OR rho <= 0
+        # NO MSG: WARN
+        # ─────────────────────────────────────────────────────────────────
+        if self._air_data_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: Barometer",
+                                    message="No messages received", hardware_id="px4_fmu")
+        d = self._air_data_msg
+        p_min = self.get_parameter("baro_pressure_min_pa").get_parameter_value().double_value
+        p_max = self.get_parameter("baro_pressure_max_pa").get_parameter_value().double_value
+
+        p = d.baro_pressure_pa
+        alt = d.baro_alt_meter
+        rho = d.rho
+
+        if math.isnan(p) or math.isnan(alt) or math.isnan(rho):
+            return DiagnosticStatus(level=ERROR, name="PX4: Barometer",
+                                    message="NaN in baro data", hardware_id="px4_fmu")
+
+        margin = 0.05
+        if p < p_min or p > p_max or rho <= 0:
+            level = ERROR
+            msg = f"Out of range: pressure={p:.0f} Pa rho={rho:.3f}"
+        elif p < p_min * (1 + margin) or p > p_max * (1 - margin):
+            level = WARN
+            msg = f"Near bounds: pressure={p:.0f} Pa"
+        else:
+            level = OK
+            msg = f"OK | alt={alt:.1f}m pressure={p:.0f}Pa rho={rho:.3f}"
+
+        kvs = [
+            KeyValue(key="baro_alt_meter",    value=f"{alt:.2f}"),
+            KeyValue(key="baro_pressure_pa",  value=f"{p:.1f}"),
+            KeyValue(key="rho_kg_m3",         value=f"{rho:.4f}"),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: Barometer",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_home_position(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: Home Position (/fmu/out/home_position)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : valid_hpos=True AND valid_lpos=True AND valid_alt=True
+        # WARN  : valid_lpos=True but valid_hpos=False (local home only)
+        # ERROR : valid_lpos=False AND valid_alt=False (no home — RTL will fail)
+        # NO MSG: WARN
+        # ─────────────────────────────────────────────────────────────────
+        if self._home_position_msg is None:
+            return DiagnosticStatus(level=WARN, name="PX4: Home Position",
+                                    message="No messages received", hardware_id="px4_fmu")
+        h = self._home_position_msg
+
+        if h.valid_hpos and h.valid_lpos and h.valid_alt:
+            level = OK
+            msg = "OK | GPS home set"
+        elif h.valid_lpos:
+            level = WARN
+            msg = "Local home only (no GPS home — RTL may use local coords)"
+        else:
+            level = ERROR
+            msg = "No home position (RTL will fail)"
+
+        kvs = [
+            KeyValue(key="valid_hpos", value=str(h.valid_hpos)),
+            KeyValue(key="valid_lpos", value=str(h.valid_lpos)),
+            KeyValue(key="valid_alt",  value=str(h.valid_alt)),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: Home Position",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
+    def _diag_geofence(self) -> DiagnosticStatus:
+        # HEALTH CRITERIA — PX4: Geofence (/fmu/out/geofence_result)
+        # ─────────────────────────────────────────────────────────────────
+        # OK    : none of the three trigger booleans is True
+        # ERROR : geofence_max_dist_triggered OR geofence_max_alt_triggered
+        #         OR geofence_custom_fence_triggered
+        # NO MSG: OK  ← geofence may simply not be configured; absence is normal
+        # ─────────────────────────────────────────────────────────────────
+        if self._geofence_result_msg is None:
+            return DiagnosticStatus(level=OK, name="PX4: Geofence",
+                                    message="No geofence configured", hardware_id="px4_fmu")
+        gf = self._geofence_result_msg
+        action_name = GEOFENCE_ACTION_NAMES.get(gf.geofence_action, str(gf.geofence_action))
+
+        breached_by: list[str] = []
+        if gf.geofence_max_dist_triggered:
+            breached_by.append("MAX_DIST")
+        if gf.geofence_max_alt_triggered:
+            breached_by.append("MAX_ALT")
+        if gf.geofence_custom_fence_triggered:
+            breached_by.append("CUSTOM")
+
+        if breached_by:
+            level = ERROR
+            msg = f"GEOFENCE BREACHED ({','.join(breached_by)}) | action={action_name}"
+        else:
+            level = OK
+            msg = f"OK | action={action_name}"
+
+        kvs = [
+            KeyValue(key="max_dist_triggered",     value=str(gf.geofence_max_dist_triggered)),
+            KeyValue(key="max_alt_triggered",      value=str(gf.geofence_max_alt_triggered)),
+            KeyValue(key="custom_fence_triggered", value=str(gf.geofence_custom_fence_triggered)),
+            KeyValue(key="geofence_action",        value=action_name),
+        ]
+        return DiagnosticStatus(level=level, name="PX4: Geofence",
+                                message=msg, hardware_id="px4_fmu", values=kvs)
+
     # ------------------------------------------------------------------ #
     # Publish loop                                                         #
     # ------------------------------------------------------------------ #
 
+    def _bp(self, name: str) -> bool:
+        return self.get_parameter(name).get_parameter_value().bool_value
+
     def _publish_diagnostics(self) -> None:
         arr = DiagnosticArray()
         arr.header.stamp = self.get_clock().now().to_msg()
-        arr.status = [
-            self._diag_vehicle_status(),
-            self._diag_failsafe(),
-            self._diag_land_detected(),
-            self._diag_cpuload(),
-            self._diag_timesync(),
-            self._diag_battery(),
-            self._diag_imu(),
-            self._diag_ang_vel(),
-            self._diag_local_position(),
-            self._diag_ekf_health(),
-            self._diag_imu_vibration(),
-            self._diag_ekf_status_flags(),
-        ]
+        statuses = []
+        if self._bp("enable_vehicle_status"):   statuses.append(self._diag_vehicle_status())
+        if self._bp("enable_failsafe"):         statuses.append(self._diag_failsafe())
+        if self._bp("enable_land_detected"):    statuses.append(self._diag_land_detected())
+        if self._bp("enable_cpuload"):          statuses.append(self._diag_cpuload())
+        if self._bp("enable_timesync"):         statuses.append(self._diag_timesync())
+        if self._bp("enable_battery"):          statuses.append(self._diag_battery())
+        if self._bp("enable_imu"):              statuses.append(self._diag_imu())
+        if self._bp("enable_angular_velocity"): statuses.append(self._diag_ang_vel())
+        if self._bp("enable_local_position"):   statuses.append(self._diag_local_position())
+        if self._bp("enable_ekf_health"):       statuses.append(self._diag_ekf_health())
+        if self._bp("enable_imu_vibration"):    statuses.append(self._diag_imu_vibration())
+        if self._bp("enable_ekf_status_flags"): statuses.append(self._diag_ekf_status_flags())
+        if self._bp("enable_gps"):              statuses.append(self._diag_gps())
+        if self._bp("enable_rc_link"):          statuses.append(self._diag_rc_link())
+        if self._bp("enable_attitude"):         statuses.append(self._diag_attitude())
+        if self._bp("enable_esc_health"):       statuses.append(self._diag_esc_health())
+        if self._bp("enable_telemetry_link"):   statuses.append(self._diag_telemetry_link())
+        if self._bp("enable_barometer"):        statuses.append(self._diag_barometer())
+        if self._bp("enable_home_position"):    statuses.append(self._diag_home_position())
+        if self._bp("enable_geofence"):         statuses.append(self._diag_geofence())
+        arr.status = statuses
         self._diag_pub.publish(arr)
 
 

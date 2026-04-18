@@ -22,6 +22,28 @@ drone_diagnostic:
   ros__parameters:
     # ── Node settings ──────────────────────────────────────────────────────────
     drone_namespace: /pequi/hermit
+
+    # ── Enable/disable individual checks ──────────────────────────────────────
+    enable_vehicle_status: true
+    enable_failsafe: true
+    enable_land_detected: true
+    enable_cpuload: true
+    enable_timesync: true
+    enable_battery: true
+    enable_imu: true
+    enable_angular_velocity: true
+    enable_local_position: true
+    enable_ekf_health: true
+    enable_imu_vibration: true
+    enable_ekf_status_flags: true
+    enable_gps: true
+    enable_rc_link: true
+    enable_attitude: true
+    enable_esc_health: true
+    enable_telemetry_link: true
+    enable_barometer: true
+    enable_home_position: true
+    enable_geofence: true
     topic_timeout_sec: 2.0          # seconds before a topic is considered stale
     publish_rate_hz: 2.0            # diagnostic publish rate
 
@@ -58,3 +80,23 @@ drone_diagnostic:
 
     # ── Battery cell balance ───────────────────────────────────────────────────
     battery_cell_delta_warn_v: 0.20 # warn  if max_cell_voltage_delta > 0.20 V
+
+    # ── GPS Quality thresholds ─────────────────────────────────────────────────
+    gps_fix_type_warn: 3        # warn  if fix_type < 3 (no 3D fix)
+    gps_fix_type_error: 2       # error if fix_type < 2
+    gps_hdop_warn: 2.0          # warn  if hdop > 2.0
+    gps_hdop_error: 5.0         # error if hdop > 5.0
+    gps_satellites_warn: 6      # warn  if satellites_used < 6
+    gps_satellites_error: 4     # error if satellites_used < 4
+
+    # ── RC Link thresholds ─────────────────────────────────────────────────────
+    rc_rssi_warn: 30            # warn  if rssi < 30 (0-255 scale; 0 = not reported)
+    rc_rssi_error: 10           # error if rssi < 10
+
+    # ── ESC Health thresholds ──────────────────────────────────────────────────
+    esc_temp_warn_c: 70.0       # warn  if any online ESC temperature > 70°C
+    esc_temp_error_c: 85.0      # error if any online ESC temperature > 85°C
+
+    # ── Barometer plausibility ─────────────────────────────────────────────────
+    baro_pressure_min_pa: 30000.0   # error if pressure < this (sensor stuck/frozen)
+    baro_pressure_max_pa: 110000.0  # error if pressure > this
