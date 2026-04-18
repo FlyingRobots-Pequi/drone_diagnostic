@@ -191,6 +191,48 @@ ros2 launch drone_diagnostics drone_diagnostics.launch.py \
 ros2 run drone_diagnostics diagnostic_node
 ```
 
+## Docker / InfluxDB
+
+`docker-compose.yml` starts an InfluxDB 2.7 instance alongside the ROS2 node.
+All tunables live in `.env`.
+
+```bash
+# Start InfluxDB (and optionally the diagnostic node)
+docker compose up -d influxdb
+
+# Tear down and delete all stored data
+docker compose down -v
+```
+
+### Storage configuration
+
+InfluxDB 2.x OSS has no hard byte-size disk cap. Storage is managed via two
+mechanisms, both configurable in `.env`:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `INFLUXDB_RETENTION` | `90d` | Bucket retention period — data older than this is deleted automatically |
+| `INFLUXDB_CACHE_MAX_MEMORY_SIZE` | `104857600` (100 MB) | In-memory write-cache cap (bytes) |
+
+The retention period is the primary knob. At this project's write rate (~2 Hz,
+small payloads), `90d` keeps total storage well under 1 GB. To target a tighter
+budget, reduce the value:
+
+```bash
+# ~1 week of history (smallest practical value for debugging)
+INFLUXDB_RETENTION=7d
+
+# 1 year (still comfortably under 1 GB for this workload)
+INFLUXDB_RETENTION=365d
+
+# Infinite retention — manage storage yourself
+INFLUXDB_RETENTION=0
+```
+
+> **Hard disk quota**: if you need a true byte-size limit, apply an OS-level
+> filesystem quota to the Docker volume host path
+> (`/var/lib/docker/volumes/diagnostic_influxdb_data`).
+
 ## Monitor
 
 ```bash

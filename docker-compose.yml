@@ -10,6 +10,11 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: aerobatics
       DOCKER_INFLUXDB_INIT_BUCKET: drone_diagnostics
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+      # Retention period for the initial bucket — data older than this is
+      # deleted automatically. Set via INFLUXDB_RETENTION in .env.
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RETENTION:-90d}
+      # In-memory write-cache cap. Set via INFLUXDB_CACHE_MAX_MEMORY_SIZE in .env.
+      INFLUXD_STORAGE_CACHE_MAX_MEMORY_SIZE: ${INFLUXDB_CACHE_MAX_MEMORY_SIZE:-104857600}
     volumes:
       - influxdb_data:/var/lib/influxdb2
     healthcheck:
