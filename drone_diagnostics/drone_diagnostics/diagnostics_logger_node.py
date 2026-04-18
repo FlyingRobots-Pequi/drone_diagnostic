@@ -3,7 +3,7 @@
 
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import rclpy
 from rclpy.node import Node
@@ -12,11 +12,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
 try:
-    from influxdb_client import InfluxDBClient
+    from influxdb_client.client.influxdb_client import InfluxDBClient
     from influxdb_client.client.write_api import SYNCHRONOUS
-    from influxdb_client.domain.write_precision import WritePrecision
     _INFLUX_AVAILABLE = True
 except ImportError:
+    InfluxDBClient = None  # type: ignore[assignment,misc]
+    SYNCHRONOUS = None  # type: ignore[assignment]
     _INFLUX_AVAILABLE = False
 
 QOS_RELIABLE = QoSProfile(
@@ -171,7 +172,7 @@ class DiagnosticsLoggerNode(Node):
                 bucket=self._bucket,
                 org=self._org,
                 record=batch,
-                write_precision=WritePrecision.NANOSECONDS,
+                write_precision="ns",
             )
             self.get_logger().debug(f"Wrote {len(batch)} points to InfluxDB")
         except Exception as exc:
