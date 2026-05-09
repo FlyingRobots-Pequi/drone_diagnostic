@@ -1,5 +1,7 @@
 *.zip
-ros*
+*.tar
 bag*
+px4_logs/
+ulg_analysis/ulg_ingestor/.ingested_logs.json
 .env
 .env.local

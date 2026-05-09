@@ -21,20 +21,33 @@ sudo apt install ros-humble-diagnostic-updater \
                  ros-humble-rqt-robot-monitor
 ```
 
-## Package layout
+## Repository layout
 
 ```
-drone_diagnostics/
-├── drone_diagnostics/
-│   ├── diagnostic_node.py       # 20 health checks → /diagnostics at 2 Hz
-│   └── diagnostics_logger_node.py  # optional InfluxDB writer
-├── config/
-│   └── diagnostics_config.yaml  # aggregator groups + tunable thresholds + enable flags
-├── launch/
-│   └── drone_diagnostics.launch.py
-├── package.xml
-├── setup.py
-└── setup.cfg
+Diagnostic/
+├── ulg_analysis/                # ULG flight-log analysis stack
+│   ├── docker-compose.yml       #   InfluxDB 2.7 + ulg_ingestor
+│   ├── ulg_ingestor/            #   ingestor source + Dockerfile
+│   │   ├── ulg_ingestor.py
+│   │   ├── requirements.txt
+│   │   └── Dockerfile
+│   ├── px4_logs/                #   input .ulg log files (gitignored)
+│   └── influxdb_queries.flux    #   Flux query reference
+├── ros_diagnostics/             # ROS2 diagnostic node stack
+│   ├── docker-compose.yml       #   drone_diagnostics containerised
+│   ├── Dockerfile
+│   ├── docker-entrypoint.sh
+│   ├── run.sh                   #   local (non-Docker) launch
+│   ├── drone_diagnostics/       #   ROS2 package source
+│   │   ├── drone_diagnostics/
+│   │   │   ├── diagnostic_node.py       # 20 health checks → /diagnostics at 2 Hz
+│   │   │   └── diagnostics_logger_node.py  # optional InfluxDB writer
+│   │   ├── config/
+│   │   │   └── diagnostics_config.yaml
+│   │   └── launch/
+│   │       └── drone_diagnostics.launch.py
+│   └── rosbags/                 #   test bags (gitignored)
+└── .env                         # Shared secrets — gitignored, used by both stacks
 ```
 
 ## Diagnostic pipeline
@@ -431,41 +444,73 @@ ros2 launch drone_diagnostics drone_diagnostics.launch.py \
 ros2 run drone_diagnostics diagnostic_node
 ```
 
-## Docker / InfluxDB
+## ULG Analysis stack (`ulg_analysis/`)
 
-`docker-compose.yml` starts an InfluxDB 2.7 instance alongside the ROS2 node.
-All tunables live in `.env`.
+Runs **InfluxDB 2.7** and the **ulg_ingestor** that watches `px4_logs/` for new
+`.ulg` files and writes full telemetry into the `px4_flight_logs` bucket.
 
 ```bash
-# Start InfluxDB (and optionally the diagnostic node)
-docker compose up -d influxdb
+cd ulg_analysis
 
-# Tear down and delete all stored data
+# Start (InfluxDB + ingestor)
+docker compose up -d
+
+# Watch ingestion progress
+docker compose logs -f ulg_ingestor
+
+# Stop (keeps data volume)
+docker compose down
+
+# Stop and wipe all stored data
 docker compose down -v
 ```
 
+**InfluxDB UI**: http://localhost:8086 — user `admin` / password `adminpassword123`
+
+Query reference: see `influxdb_queries.flux` at the project root.
+
 ### Storage configuration
 
-InfluxDB 2.x OSS has no hard byte-size disk cap. Storage is managed via two
-mechanisms, both configurable in `.env`:
+All tunables live in `.env` at the project root.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `INFLUXDB_RETENTION` | `90d` | Bucket retention period — data older than this is deleted automatically |
-| `INFLUXDB_CACHE_MAX_MEMORY_SIZE` | `104857600` (100 MB) | In-memory write-cache cap (bytes) |
-
-The retention period is the primary knob. At this project's write rate (~2 Hz,
-small payloads), `90d` keeps total storage well under 1 GB.
+| `INFLUXDB_CACHE_MAX_MEMORY_SIZE` | `268435456` (256 MB) | In-memory write-cache cap; increase to 512 MB if write stalls appear during heavy ingestion |
 
 ```bash
 INFLUXDB_RETENTION=7d    # ~1 week of history
-INFLUXDB_RETENTION=365d  # 1 year (still < 1 GB for this workload)
-INFLUXDB_RETENTION=0     # infinite retention — manage storage yourself
+INFLUXDB_RETENTION=365d  # 1 year
+INFLUXDB_RETENTION=0     # infinite — manage storage yourself
 ```
 
-> **Hard disk quota**: if you need a true byte-size limit, apply an OS-level
-> filesystem quota to the Docker volume host path
-> (`/var/lib/docker/volumes/diagnostic_influxdb_data`).
+> **Note**: Docker does not cap InfluxDB memory by default. The write-cache
+> variable above is InfluxDB's own heap budget. Setting a hard Docker
+> `mem_limit` is not recommended — it causes OOM kills during bulk ingestion.
+
+---
+
+## ROS Diagnostics stack (`ros_diagnostics/`)
+
+Containerised version of the diagnostic node. Requires the uXRCE-DDS bridge to
+be running on the host and reachable on the same LAN segment.
+
+```bash
+cd ros_diagnostics
+
+# Build image and start node
+docker compose up -d --build
+
+# Follow logs
+docker compose logs -f drone_diagnostics
+```
+
+Uses `network_mode: host` so the container sees the same ROS2/DDS multicast
+traffic as the host. All InfluxDB credentials are read from the shared `.env`
+at the project root.
+
+> **Local development**: `run.sh` at the project root builds and launches the
+> node directly on the host (no Docker) and is faster to iterate with.
 
 ---
 

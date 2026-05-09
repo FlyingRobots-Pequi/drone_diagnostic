@@ -1,0 +1,45 @@
+services:
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    env_file: ../.env
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminpassword123
+      DOCKER_INFLUXDB_INIT_ORG: aerobatics
+      DOCKER_INFLUXDB_INIT_BUCKET: drone_diagnostics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUXDB_RETENTION:-90d}
+      INFLUXD_STORAGE_CACHE_MAX_MEMORY_SIZE: ${INFLUXDB_CACHE_MAX_MEMORY_SIZE:-268435456}
+      # Cap parallel UI/API queries so bulk ingestion is not starved.
+      INFLUXD_QUERY_CONCURRENCY: "4"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ulg_ingestor:
+    build:
+      context: ./ulg_ingestor
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    env_file: ../.env
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_ORG: aerobatics
+      ULG_WATCH_DIR: /px4_logs
+      ULG_STATE_FILE: /state/.ingested_logs.json
+    volumes:
+      - ./px4_logs:/px4_logs:ro
+      - ./ulg_ingestor:/state
+    restart: unless-stopped
+
+volumes:
+  influxdb_data:

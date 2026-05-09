@@ -1,0 +1,21 @@
+services:
+  drone_diagnostics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # host networking is required so the container sees ROS2/DDS traffic
+    # on the same LAN segment as the drone's uXRCE bridge
+    network_mode: host
+    env_file: ../.env
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_URL: ${INFLUXDB_URL:-http://localhost:8086}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-aerobatics}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-drone_diagnostics}
+    command: >
+      ros2 launch drone_diagnostics drone_diagnostics.launch.py
+        enable_influxdb:=true
+        influxdb_url:=http://localhost:8086
+        influxdb_org:=aerobatics
+        influxdb_bucket:=drone_diagnostics
+    restart: unless-stopped

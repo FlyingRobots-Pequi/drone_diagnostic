@@ -100,7 +100,7 @@ The aggregator groups statuses by name prefix:
 # Workspace is at ~/ros2_humble (not ~/ros2_ws)
 # Package is already in ~/ros2_humble/src/drone_diagnostics
 # After editing, sync from repo:
-cp .../Diagnostic/drone_diagnostics/drone_diagnostics/diagnostic_node.py \
+cp .../Diagnostic/ros_diagnostics/drone_diagnostics/drone_diagnostics/diagnostic_node.py \
    ~/ros2_humble/src/drone_diagnostics/drone_diagnostics/
 
 # Build
@@ -124,10 +124,10 @@ ros2 run rqt_robot_monitor rqt_robot_monitor
 
 ## Rosbags
 
-All bags are under: `/mnt/316f1a60-da34-40af-9076-4b3ee9fb0ed1/Documents/PMec/Flying/Diagnostic/rosbags/`
+All bags are under: `/mnt/316f1a60-da34-40af-9076-4b3ee9fb0ed1/Documents/PMec/Flying/Diagnostic/ros_diagnostics/rosbags/`
 
 ### bag_with_px4
-- **Path**: `rosbags/bag_with_px4`
+- **Path**: `ros_diagnostics/rosbags/bag_with_px4`
 - **Duration**: 14s | **Messages**: 9021 | **Date**: 2026-03-07
 - **fmu/out topics with data**: sensor_combined (1422), vehicle_angular_velocity (1422),
   vehicle_local_position (1425), estimator_status (1425), vehicle_status (28),
@@ -137,13 +137,13 @@ All bags are under: `/mnt/316f1a60-da34-40af-9076-4b3ee9fb0ed1/Documents/PMec/Fl
   deserialization — px4_msgs version mismatch between workspace and bag recording
 
 ### bag_with_px4_60
-- **Path**: `rosbags/bag_with_px4_60`
+- **Path**: `ros_diagnostics/rosbags/bag_with_px4_60`
 - **Duration**: 60s | **Messages**: 38549 | **Date**: 2026-03-07
 - **fmu/out topics with data**: same as bag_with_px4 but ~4× more messages
 - **Same CDR issue** as bag_with_px4
 
 ### rosbag_logging_test
-- **Path**: `rosbags/rosbag_logging_test`
+- **Path**: `ros_diagnostics/rosbags/rosbag_logging_test`
 - **Duration**: 19s | **Messages**: 233 | **Date**: 2026-03-03
 - **Active topics**: `/fmu/in/offboard_control_mode` (191 msgs), `/rosout` (42 msgs)
 - **No fmu/out data** — all diagnostic checks will report ERROR/WARN (expected)
@@ -154,7 +154,7 @@ All bags are under: `/mnt/316f1a60-da34-40af-9076-4b3ee9fb0ed1/Documents/PMec/Fl
 cd ~/ros2_humble && source install/setup.bash
 ros2 run drone_diagnostics diagnostic_node &
 sleep 2
-ros2 bag play rosbags/bag_with_px4 --clock &
+ros2 bag play ros_diagnostics/rosbags/bag_with_px4 --clock &
 sleep 5
 ros2 topic echo /diagnostics --once
 ```
