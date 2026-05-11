@@ -1,4 +1,4 @@
-import json, tempfile, os
+import tempfile, os
 from pid_optimizer.plant_model import PlantModel, Inertia, Drag
 
 def test_roundtrip_json():
