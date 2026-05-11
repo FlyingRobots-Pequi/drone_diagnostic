@@ -18,7 +18,7 @@ def test_tournament_selects_better():
 
 def test_crossover_genes_from_parents():
     bounds = [(0.0, 1.0)] * 4
-    ga = GeneticAlgorithm(bounds, fitness_fn=lambda x: 0.0, pop_size=4, seed=0)
+    ga = GeneticAlgorithm(bounds, fitness_fn=lambda _: 0.0, pop_size=4, seed=0)
     p1 = np.array([0.1, 0.2, 0.3, 0.4])
     p2 = np.array([0.9, 0.8, 0.7, 0.6])
     child = ga._crossover(p1, p2, prob=1.0)
@@ -27,7 +27,7 @@ def test_crossover_genes_from_parents():
 
 def test_mutation_stays_in_bounds():
     bounds = [(0.0, 1.0)] * 6
-    ga = GeneticAlgorithm(bounds, fitness_fn=lambda x: 0.0, pop_size=4, seed=1)
+    ga = GeneticAlgorithm(bounds, fitness_fn=lambda _: 0.0, pop_size=4, seed=1)
     ind = np.array([0.5] * 6)
     for _ in range(100):
         mutated = ga._mutate(ind, prob=1.0)

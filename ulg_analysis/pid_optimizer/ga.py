@@ -27,8 +27,8 @@ class GeneticAlgorithm:
         self.rng = np.random.default_rng(seed)
         self.n_genes = len(bounds)
 
-        self.population: np.ndarray = None
-        self.scores: np.ndarray = None
+        self.population: Optional[np.ndarray] = None
+        self.scores: Optional[np.ndarray] = None
         self.generation: int = 0
         self.history: List[dict] = []  # per-generation stats
 
@@ -38,6 +38,7 @@ class GeneticAlgorithm:
 
     @property
     def best_individual(self) -> np.ndarray:
+        assert self.population is not None and self.scores is not None, "Call initialize() first"
         return self.population[self.scores.argmin()].copy()
 
     def initialize(self) -> None:
@@ -67,6 +68,7 @@ class GeneticAlgorithm:
 
     def step(self) -> None:
         """Advance one generation."""
+        assert self.population is not None and self.scores is not None, "Call initialize() first"
         new_pop = np.empty_like(self.population)
         for i in range(self.pop_size):
             p1_idx = self._tournament(self.scores, self.tournament_size)
@@ -94,6 +96,7 @@ class GeneticAlgorithm:
         })
 
     def save_checkpoint(self, path: str) -> None:
+        assert self.population is not None and self.scores is not None, "Call initialize() first"
         payload = {
             "generation": self.generation,
             "history": self.history,
