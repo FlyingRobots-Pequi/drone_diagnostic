@@ -1,6 +1,5 @@
 """Tests for pid_optimizer.params_io module."""
 
-import pytest
 from pid_optimizer.params_io import load_params, save_params
 from pid_optimizer.gains import Gains
 

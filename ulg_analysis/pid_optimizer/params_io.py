@@ -1,9 +1,5 @@
-"""I/O for PX4 .params files (QGroundControl text format)."""
-
 from .gains import Gains
 
-# Build reverse mapping: PX4 key -> field name
-# Based on Gains.to_px4_params() method in gains.py
 _PX4_TO_FIELD = {
     "MC_ROLLRATE_P": "rollrate_P",
     "MC_ROLLRATE_I": "rollrate_I",
@@ -32,68 +28,26 @@ _PX4_TO_FIELD = {
 
 
 def save_params(gains: Gains, path: str) -> None:
-    """Save Gains to a PX4 .params file (QGroundControl text format).
-
-    Format:
-        # Exported by pid_optimizer
-        KEY1\tVALUE1
-        KEY2\tVALUE2
-        ...
-
-    Args:
-        gains: Gains object to save
-        path: Output file path
-    """
     px4_params = gains.to_px4_params()
 
     with open(path, "w") as f:
         f.write("# Exported by pid_optimizer\n")
         for key in sorted(px4_params.keys()):
-            value = px4_params[key]
-            # Format with .6g: compact, no trailing zeros
-            f.write(f"{key}\t{value:.6g}\n")
+            f.write(f"{key}\t{px4_params[key]:.6g}\n")
 
 
 def load_params(path: str) -> Gains:
-    """Load Gains from a PX4 .params file.
-
-    Starts with Gains() defaults and updates only fields present in the file.
-    Lines starting with '#' are comments and skipped.
-    Unknown keys are silently ignored.
-
-    Args:
-        path: Input file path
-
-    Returns:
-        Gains object with values from file (or defaults for missing keys)
-    """
     gains_dict = {}
-
-    with open(path, "r") as f:
+    with open(path) as f:
         for line in f:
             line = line.rstrip("\n")
-            # Skip empty lines and comments
             if not line or line.startswith("#"):
                 continue
-
-            # Parse as tab-separated key-value
             parts = line.split("\t")
             if len(parts) != 2:
                 continue
-
             px4_key, value_str = parts
-
-            # Map PX4 key to field name
             if px4_key not in _PX4_TO_FIELD:
-                # Unknown key, silently ignore
                 continue
-
-            field_name = _PX4_TO_FIELD[px4_key]
-            try:
-                gains_dict[field_name] = float(value_str)
-            except ValueError:
-                # Malformed value, skip this line
-                continue
-
-    # Create Gains with defaults, then update with loaded values
+            gains_dict[_PX4_TO_FIELD[px4_key]] = float(value_str)
     return Gains(**gains_dict)
