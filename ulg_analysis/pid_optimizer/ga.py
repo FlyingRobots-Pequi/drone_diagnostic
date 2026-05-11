@@ -17,6 +17,8 @@ class GeneticAlgorithm:
         mutation_sigma_frac: float = 0.05,
         seed: Optional[int] = None,
     ):
+        if tournament_size > pop_size:
+            raise ValueError(f"tournament_size ({tournament_size}) must be <= pop_size ({pop_size})")
         self.bounds = bounds
         self.fitness_fn = fitness_fn
         self.pop_size = pop_size
@@ -32,14 +34,19 @@ class GeneticAlgorithm:
         self.generation: int = 0
         self.history: List[dict] = []  # per-generation stats
 
+    def _require_initialized(self) -> None:
+        if self.population is None or self.scores is None:
+            raise RuntimeError("Call initialize() before accessing population state")
+
     @property
     def best_fitness(self) -> float:
-        return float(self.scores.min()) if self.scores is not None else float("inf")
+        self._require_initialized()
+        return float(self.scores.min())  # type: ignore[union-attr]
 
     @property
     def best_individual(self) -> np.ndarray:
-        assert self.population is not None and self.scores is not None, "Call initialize() first"
-        return self.population[self.scores.argmin()].copy()
+        self._require_initialized()
+        return self.population[self.scores.argmin()].copy()  # type: ignore[index]
 
     def initialize(self) -> None:
         lo = np.array([b[0] for b in self.bounds])
@@ -68,7 +75,8 @@ class GeneticAlgorithm:
 
     def step(self) -> None:
         """Advance one generation."""
-        assert self.population is not None and self.scores is not None, "Call initialize() first"
+        self._require_initialized()
+        assert self.population is not None and self.scores is not None
         new_pop = np.empty_like(self.population)
         for i in range(self.pop_size):
             p1_idx = self._tournament(self.scores, self.tournament_size)
@@ -96,7 +104,8 @@ class GeneticAlgorithm:
         })
 
     def save_checkpoint(self, path: str) -> None:
-        assert self.population is not None and self.scores is not None, "Call initialize() first"
+        self._require_initialized()
+        assert self.population is not None and self.scores is not None
         payload = {
             "generation": self.generation,
             "history": self.history,
@@ -111,7 +120,14 @@ class GeneticAlgorithm:
     def load_checkpoint(self, path: str) -> None:
         with open(path) as f:
             payload = json.load(f)
+        pop = np.array(payload["population"])
+        scores = np.array(payload["scores"])
+        expected = (self.pop_size, self.n_genes)
+        if pop.shape != expected:
+            raise ValueError(f"Checkpoint population shape {pop.shape} != expected {expected}")
+        if scores.shape != (self.pop_size,):
+            raise ValueError(f"Checkpoint scores shape {scores.shape} != expected ({self.pop_size},)")
         self.generation = payload["generation"]
         self.history = payload["history"]
-        self.population = np.array(payload["population"])
-        self.scores = np.array(payload["scores"])
+        self.population = pop
+        self.scores = scores
