@@ -1,9 +1,196 @@
-# Placeholder — to be implemented in a future task
+import numpy as np
+import pandas as pd
+from .plant_model import PlantModel
+from .gains import Gains
+
+
+def _euler_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """ZYX rotation matrix: body to world."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr],
+        [sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr],
+        [-sp,    cp*sr,             cp*cr],
+    ])
+
+
+class _RateController:
+    def __init__(self, P, I, D, K, dt, integral_limit=0.3):
+        self.P, self.I, self.D, self.K = P, I, D, K
+        self.dt = dt
+        self._integral = np.zeros(3)
+        self._prev_rate = np.zeros(3)
+        self._integral_limit = integral_limit
+
+    def reset(self):
+        self._integral[:] = 0.0
+        self._prev_rate[:] = 0.0
+
+    def update(self, setpoint: np.ndarray, actual: np.ndarray) -> np.ndarray:
+        error = setpoint - actual
+        self._integral += error * self.dt
+        self._integral = np.clip(self._integral, -self._integral_limit, self._integral_limit)
+        # D on measurement to avoid derivative kick on setpoint change
+        d_term = -(actual - self._prev_rate) / self.dt
+        self._prev_rate = actual.copy()
+        P_vec = np.array([self.P[0], self.P[1], self.P[2]])
+        I_vec = np.array([self.I[0], self.I[1], self.I[2]])
+        D_vec = np.array([self.D[0], self.D[1], self.D[2]])
+        K_vec = np.array([self.K[0], self.K[1], self.K[2]])
+        return K_vec * (P_vec * error + I_vec * self._integral + D_vec * d_term)
+
+
+class _AttitudeController:
+    def __init__(self, roll_P, pitch_P, yaw_P, rate_limit=np.deg2rad(220)):
+        self.P = np.array([roll_P, pitch_P, yaw_P])
+        self.rate_limit = rate_limit
+
+    def update(self, setpoint_euler: np.ndarray, actual_euler: np.ndarray) -> np.ndarray:
+        error = setpoint_euler - actual_euler
+        error[2] = (error[2] + np.pi) % (2 * np.pi) - np.pi  # wrap yaw
+        rate_sp = self.P * error
+        return np.clip(rate_sp, -self.rate_limit, self.rate_limit)
+
+
+class _VelocityController:
+    def __init__(self, xy_P, xy_I, xy_D, z_P, z_I, z_D, dt, integral_limit=5.0):
+        self.P = np.array([xy_P, xy_P, z_P])
+        self.I = np.array([xy_I, xy_I, z_I])
+        self.D = np.array([xy_D, xy_D, z_D])
+        self.dt = dt
+        self._integral = np.zeros(3)
+        self._prev_error = np.zeros(3)
+        self._integral_limit = integral_limit
+
+    def reset(self):
+        self._integral[:] = 0.0
+        self._prev_error[:] = 0.0
+
+    def update(self, vel_sp: np.ndarray, vel_actual: np.ndarray) -> np.ndarray:
+        error = vel_sp - vel_actual
+        self._integral += error * self.dt
+        self._integral = np.clip(self._integral, -self._integral_limit, self._integral_limit)
+        d_term = (error - self._prev_error) / self.dt
+        self._prev_error = error.copy()
+        return self.P * error + self.I * self._integral + self.D * d_term
+
+
+class _PositionController:
+    def __init__(self, xy_P, z_P, xy_vel_max=12.0, z_vel_max_up=3.0, z_vel_max_dn=1.5):
+        self.P = np.array([xy_P, xy_P, z_P])
+        self._vel_max = np.array([xy_vel_max, xy_vel_max, max(z_vel_max_up, z_vel_max_dn)])
+
+    def update(self, pos_sp: np.ndarray, pos_actual: np.ndarray) -> np.ndarray:
+        vel_sp = self.P * (pos_sp - pos_actual)
+        return np.clip(vel_sp, -self._vel_max, self._vel_max)
 
 
 class PX4Simulator:
-    pass
+    """Simulate PX4 cascaded MC controller + rigid body plant."""
+
+    def __init__(self, plant: PlantModel, gains: Gains):
+        self.plant = plant
+        self.gains = gains
+
+    def run(self, setpoints: pd.DataFrame, dt: float = 0.004) -> pd.DataFrame:
+        """
+        setpoints: DataFrame with columns [x, y, z, vx, vy, vz, roll, pitch, yaw]
+        Returns DataFrame with simulated state at each timestep:
+            [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
+        """
+        g = self.gains
+        p = self.plant
+
+        pos_ctrl = _PositionController(g.xy_pos_P, g.z_pos_P)
+        vel_ctrl = _VelocityController(g.xy_vel_P, g.xy_vel_I, g.xy_vel_D,
+                                        g.z_vel_P, g.z_vel_I, g.z_vel_D, dt)
+        att_ctrl = _AttitudeController(g.roll_P, g.pitch_P, g.yaw_P)
+        rate_ctrl = _RateController(
+            P=[g.rollrate_P, g.pitchrate_P, g.yawrate_P],
+            I=[g.rollrate_I, g.pitchrate_I, g.yawrate_I],
+            D=[g.rollrate_D, g.pitchrate_D, g.yawrate_D],
+            K=[g.rollrate_K, g.pitchrate_K, g.yawrate_K],
+            dt=dt,
+        )
+
+        # State: [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
+        state = np.zeros(12)
+        G = 9.81
+        I_vec = np.array([p.inertia.Ixx, p.inertia.Iyy, p.inertia.Izz])
+        max_thrust = 2.0 * p.mass_kg * G  # max thrust ~ 2× weight
+
+        records = []
+        for i in range(len(setpoints)):
+            sp = setpoints.iloc[i]
+            pos = state[0:3]
+            vel = state[3:6]
+            euler = state[6:9]
+            omega = state[9:12]
+
+            pos_sp = np.array([sp["x"], sp["y"], sp["z"]])
+            vel_sp = pos_ctrl.update(pos_sp, pos)
+            vel_sp += np.array([sp["vx"], sp["vy"], sp["vz"]])  # feed-forward
+
+            acc_sp = vel_ctrl.update(vel_sp, vel)
+
+            # Acceleration setpoint → thrust + attitude (NED frame)
+            # In NED: thrust opposes gravity (+z). Net acc_z = -thrust/m + g
+            # So thrust = (G - acc_sp_z) * mass (more thrust to go up = negative acc_sp_z)
+            thrust_sp = np.clip((G - acc_sp[2]) * p.mass_kg, 0.0, max_thrust)
+            # The setpoint DataFrame may carry explicit roll/pitch attitude commands
+            # (e.g. from a ULG-extracted attitude setpoint). When those are provided,
+            # use them directly. When they are zero the acceleration-derived tilt from
+            # lateral position/velocity control takes effect additively.
+            acc_roll  = np.clip(np.arctan2(acc_sp[1], G), -np.deg2rad(45), np.deg2rad(45))
+            acc_pitch = np.clip(np.arctan2(-acc_sp[0], G), -np.deg2rad(45), np.deg2rad(45))
+            att_sp = np.array([
+                sp["roll"]  if sp["roll"]  != 0.0 else acc_roll,
+                sp["pitch"] if sp["pitch"] != 0.0 else acc_pitch,
+                sp["yaw"],
+            ])
+
+            rate_sp = att_ctrl.update(att_sp, euler)
+            torque_cmd = rate_ctrl.update(rate_sp, omega)
+
+            # Rigid body dynamics (NED frame: z positive down, gravity = +G in z)
+            R = _euler_to_R(*euler)
+            # Thrust acts in -z_body direction (upward in body frame)
+            thrust_body = np.array([0.0, 0.0, -thrust_sp])
+            # a_world = thrust_world/m + gravity; gravity = [0, 0, +G] in NED
+            a_world = R @ thrust_body / p.mass_kg + np.array([0.0, 0.0, G])
+            drag_coeff = np.array([p.drag.kD_xy, p.drag.kD_xy, p.drag.kD_z])
+            a_drag = -drag_coeff * vel / p.mass_kg
+            a_total = a_world + a_drag
+
+            # Rotational dynamics
+            scale = np.array([p.inertia.Ixx * 50, p.inertia.Iyy * 50, p.inertia.Izz * 20])
+            tau = torque_cmd * scale
+            alpha = (tau - np.cross(omega, I_vec * omega)) / I_vec
+
+            # Motor lag
+            alpha *= dt / (p.tau_motor_s + dt)
+
+            # Integrate
+            state[0:3] = pos + vel * dt
+            state[3:6] = vel + a_total * dt
+            state[6:9] = euler + omega * dt
+            state[9:12] = omega + alpha * dt
+
+            records.append(state.copy())
+
+        cols = ["x", "y", "z", "vx", "vy", "vz", "roll", "pitch", "yaw", "p", "q", "r"]
+        return pd.DataFrame(records, columns=cols)
 
 
-def compute_rmse(*args, **kwargs):
-    raise NotImplementedError
+def compute_rmse(simulated: pd.DataFrame, reference: pd.DataFrame,
+                  cols: list = None) -> dict:
+    """RMSE per column between two DataFrames of the same length."""
+    if cols is None:
+        cols = simulated.columns.tolist()
+    n = min(len(simulated), len(reference))
+    return {
+        col: float(np.sqrt(np.mean((simulated[col].values[:n] - reference[col].values[:n]) ** 2)))
+        for col in cols
+    }
