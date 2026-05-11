@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 from pid_optimizer.plant_model import PlantModel, Inertia, Drag
 from pid_optimizer.gains import Gains

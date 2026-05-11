@@ -1,3 +1,4 @@
+from typing import Optional
 import numpy as np
 import pandas as pd
 from .plant_model import PlantModel
@@ -185,12 +186,13 @@ class PX4Simulator:
 
 
 def compute_rmse(simulated: pd.DataFrame, reference: pd.DataFrame,
-                  cols: list = None) -> dict:
+                  cols: Optional[list] = None) -> dict:
     """RMSE per column between two DataFrames of the same length."""
-    if cols is None:
-        cols = simulated.columns.tolist()
+    effective_cols: list = simulated.columns.tolist() if cols is None else cols
     n = min(len(simulated), len(reference))
     return {
-        col: float(np.sqrt(np.mean((simulated[col].values[:n] - reference[col].values[:n]) ** 2)))
-        for col in cols
+        col: float(np.sqrt(np.mean(
+            (simulated[col].to_numpy()[:n] - reference[col].to_numpy()[:n]) ** 2
+        )))
+        for col in effective_cols
     }
