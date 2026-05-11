@@ -43,7 +43,7 @@ def test_hover_stays_near_origin():
     setpoints = pd.DataFrame({
         "x": [0.0] * n_steps, "y": [0.0] * n_steps, "z": [-1.0] * n_steps,
         "vx": [0.0] * n_steps, "vy": [0.0] * n_steps, "vz": [0.0] * n_steps,
-        "roll": [0.0] * n_steps, "pitch": [0.0] * n_steps, "yaw": [0.0] * n_steps,
+        "roll": [float('nan')] * n_steps, "pitch": [float('nan')] * n_steps, "yaw": [0.0] * n_steps,
     })
     result = sim.run(setpoints, dt=0.004)
     # After 2 seconds (500 steps × 0.004s), position should be within 1m of setpoint

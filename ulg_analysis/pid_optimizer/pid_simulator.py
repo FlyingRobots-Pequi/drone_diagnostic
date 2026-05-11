@@ -144,13 +144,12 @@ class PX4Simulator:
             # (e.g. from a ULG-extracted attitude setpoint). When those are provided,
             # use them directly. When they are zero the acceleration-derived tilt from
             # lateral position/velocity control takes effect additively.
-            acc_roll  = np.clip(np.arctan2(acc_sp[1], G), -np.deg2rad(45), np.deg2rad(45))
-            acc_pitch = np.clip(np.arctan2(-acc_sp[0], G), -np.deg2rad(45), np.deg2rad(45))
-            att_sp = np.array([
-                sp["roll"]  if sp["roll"]  != 0.0 else acc_roll,
-                sp["pitch"] if sp["pitch"] != 0.0 else acc_pitch,
-                sp["yaw"],
-            ])
+            roll_sp_from_acc  = np.clip(np.arctan2(acc_sp[1], G), -np.deg2rad(45), np.deg2rad(45))
+            pitch_sp_from_acc = np.clip(np.arctan2(-acc_sp[0], G), -np.deg2rad(45), np.deg2rad(45))
+            # NaN in roll/pitch column means "derive from acceleration"; explicit value overrides.
+            roll_sp  = sp["roll"]  if not np.isnan(sp["roll"])  else roll_sp_from_acc
+            pitch_sp = sp["pitch"] if not np.isnan(sp["pitch"]) else pitch_sp_from_acc
+            att_sp = np.array([roll_sp, pitch_sp, sp["yaw"]])
 
             rate_sp = att_ctrl.update(att_sp, euler)
             torque_cmd = rate_ctrl.update(rate_sp, omega)
@@ -166,6 +165,10 @@ class PX4Simulator:
             a_total = a_world + a_drag
 
             # Rotational dynamics
+            # Deliberate approximation: maps normalized rate-controller output [-1,1] to N·m.
+            # Factors (50 roll/pitch, 20 yaw) are not derived from motor geometry — they
+            # scale the dimensionless torque command to a physically plausible range given
+            # the identified inertia. Replace with kT*arm*RPM² model after motor ID.
             scale = np.array([p.inertia.Ixx * 50, p.inertia.Iyy * 50, p.inertia.Izz * 20])
             tau = torque_cmd * scale
             alpha = (tau - np.cross(omega, I_vec * omega)) / I_vec
