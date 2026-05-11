@@ -182,7 +182,7 @@ class PX4Simulator:
             records.append(state.copy())
 
         cols = ["x", "y", "z", "vx", "vy", "vz", "roll", "pitch", "yaw", "p", "q", "r"]
-        return pd.DataFrame(records, columns=cols)
+        return pd.DataFrame(records, columns=cols)  # type: ignore[arg-type]
 
 
 def compute_rmse(simulated: pd.DataFrame, reference: pd.DataFrame,
