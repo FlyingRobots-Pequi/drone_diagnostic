@@ -1,0 +1,45 @@
+import numpy as np
+from pid_optimizer.ga import GeneticAlgorithm
+from pid_optimizer.gains import GAIN_BOUNDS
+
+# Trivial fitness: minimize sum of all gains (lower = better)
+def mock_fitness(gains_array: np.ndarray) -> float:
+    return float(np.sum(gains_array))
+
+def test_tournament_selects_better():
+    ga = GeneticAlgorithm(GAIN_BOUNDS, fitness_fn=mock_fitness, pop_size=10, seed=42)
+    ga.initialize()
+    pop = ga.population
+    scores = np.array([mock_fitness(ind) for ind in pop])
+    winner_idx = ga._tournament(scores, tournament_size=3)
+    winner_score = scores[winner_idx]
+    # Winner should be at or below median score
+    assert winner_score <= np.median(scores)
+
+def test_crossover_genes_from_parents():
+    bounds = [(0.0, 1.0)] * 4
+    ga = GeneticAlgorithm(bounds, fitness_fn=lambda x: 0.0, pop_size=4, seed=0)
+    p1 = np.array([0.1, 0.2, 0.3, 0.4])
+    p2 = np.array([0.9, 0.8, 0.7, 0.6])
+    child = ga._crossover(p1, p2, prob=1.0)
+    for i, v in enumerate(child):
+        assert v == p1[i] or v == p2[i], f"Gene {i}={v} not from either parent"
+
+def test_mutation_stays_in_bounds():
+    bounds = [(0.0, 1.0)] * 6
+    ga = GeneticAlgorithm(bounds, fitness_fn=lambda x: 0.0, pop_size=4, seed=1)
+    ind = np.array([0.5] * 6)
+    for _ in range(100):
+        mutated = ga._mutate(ind, prob=1.0)
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
+        assert np.all(mutated >= lo) and np.all(mutated <= hi)
+
+def test_ga_improves_fitness():
+    ga = GeneticAlgorithm(GAIN_BOUNDS, fitness_fn=mock_fitness,
+                           pop_size=30, seed=7)
+    ga.initialize()
+    initial_best = ga.best_fitness
+    for _ in range(10):
+        ga.step()
+    assert ga.best_fitness <= initial_best, "Fitness should decrease (minimize sum)"
