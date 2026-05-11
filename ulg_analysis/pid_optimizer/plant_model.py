@@ -1,5 +1,6 @@
 from dataclasses import dataclass, asdict
 import json
+from typing import Optional
 
 
 @dataclass
@@ -24,7 +25,7 @@ class PlantModel:
     drag: Drag
     arm_length_m: float
     source_log: str = ""
-    fit_rmse: dict = None
+    fit_rmse: Optional[dict] = None
 
     def save(self, path: str) -> None:
         with open(path, "w") as f:

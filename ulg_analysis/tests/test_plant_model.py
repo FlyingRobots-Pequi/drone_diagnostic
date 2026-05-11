@@ -17,9 +17,24 @@ def test_roundtrip_json():
     try:
         model.save(path)
         loaded = PlantModel.load(path)
-        assert loaded.mass_kg == model.mass_kg
-        assert loaded.inertia.Ixx == model.inertia.Ixx
-        assert loaded.drag.kD_xy == model.drag.kD_xy
-        assert loaded.fit_rmse == model.fit_rmse
+        assert loaded == model
+    finally:
+        os.unlink(path)
+
+
+def test_roundtrip_json_none_fit_rmse():
+    model = PlantModel(
+        mass_kg=1.5,
+        kT=1e-6,
+        tau_motor_s=0.02,
+        inertia=Inertia(Ixx=0.01, Iyy=0.01, Izz=0.02),
+        drag=Drag(kD_xy=0.1, kD_z=0.2),
+        arm_length_m=0.15,
+    )
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        path = f.name
+    try:
+        model.save(path)
+        assert PlantModel.load(path) == model
     finally:
         os.unlink(path)
