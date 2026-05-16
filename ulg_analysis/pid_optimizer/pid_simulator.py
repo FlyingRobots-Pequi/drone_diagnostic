@@ -95,9 +95,13 @@ class PX4Simulator:
         self.plant = plant
         self.gains = gains
 
-    def run(self, setpoints: pd.DataFrame, dt: float = 0.004) -> pd.DataFrame:
+    def run(self, setpoints: pd.DataFrame, dt: float = 0.004,
+            x0: Optional[np.ndarray] = None) -> pd.DataFrame:
         """
         setpoints: DataFrame with columns [x, y, z, vx, vy, vz, roll, pitch, yaw]
+        x0: optional initial state [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r].
+            When None the simulator starts from all-zeros (wrong for real logs — always
+            extract x0 from the ULG at t_start to avoid large initial attitude error).
         Returns DataFrame with simulated state at each timestep:
             [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
         """
@@ -117,7 +121,7 @@ class PX4Simulator:
         )
 
         # State: [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
-        state = np.zeros(12)
+        state = np.zeros(12) if x0 is None else x0.copy()
         G = 9.81
         I_vec = np.array([p.inertia.Ixx, p.inertia.Iyy, p.inertia.Izz])
         max_thrust = 2.0 * p.mass_kg * G  # max thrust ~ 2× weight
@@ -186,6 +190,115 @@ class PX4Simulator:
 
         cols = ["x", "y", "z", "vx", "vy", "vz", "roll", "pitch", "yaw", "p", "q", "r"]
         return pd.DataFrame(records, columns=cols)  # type: ignore[arg-type]
+
+
+    def run_open_loop(
+        self,
+        torque_Nm: pd.DataFrame,
+        thrust_N: pd.DataFrame,
+        dt: float = 0.004,
+        x0: Optional[np.ndarray] = None,
+    ) -> pd.DataFrame:
+        """
+        Open-loop plant simulation — bypasses all PID controllers.
+
+        torque_Nm: DataFrame with columns [tau_x, tau_y, tau_z] in N·m (FRD body frame).
+                   Extracted from vehicle_torque_setpoint.xyz[0..2].
+        thrust_N:  DataFrame with column [F] in Newtons, positive = upward.
+                   Derived from vehicle_thrust_setpoint.xyz[2]:
+                   F = plant.kT * 4 * xyz[2]**2
+        x0: initial state [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r].
+            Always extract from the ULG at t_start.
+
+        Returns DataFrame [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r].
+        """
+        p = self.plant
+        state = np.zeros(12) if x0 is None else x0.copy()
+        G = 9.81
+        I_vec = np.array([p.inertia.Ixx, p.inertia.Iyy, p.inertia.Izz])
+        drag = np.array([p.drag.kD_xy, p.drag.kD_xy, p.drag.kD_z])
+        N = min(len(torque_Nm), len(thrust_N))
+
+        records = []
+        for i in range(N):
+            tau = torque_Nm.iloc[i][["tau_x", "tau_y", "tau_z"]].to_numpy(dtype=float)
+            F = float(thrust_N.iloc[i]["F"])            # N, positive upward
+
+            pos, vel, euler, omega = state[0:3], state[3:6], state[6:9], state[9:12]
+            R = _euler_to_R(*euler)
+            thrust_body = np.array([0.0, 0.0, -F])      # upward in body = -z_body
+            a_world = R @ thrust_body / p.mass_kg + np.array([0.0, 0.0, G])
+            a_drag = -drag * vel / p.mass_kg
+
+            alpha = (tau - np.cross(omega, I_vec * omega)) / I_vec
+            alpha *= dt / (p.tau_motor_s + dt)           # first-order motor lag
+
+            state[0:3] = pos + vel * dt
+            state[3:6] = vel + (a_world + a_drag) * dt
+            state[6:9] = euler + omega * dt
+            state[9:12] = omega + alpha * dt
+            records.append(state.copy())
+
+        cols = ["x", "y", "z", "vx", "vy", "vz", "roll", "pitch", "yaw", "p", "q", "r"]
+        return pd.DataFrame(records, columns=cols)  # type: ignore[arg-type]
+
+
+    def run_translational(
+        self,
+        thrust_N: pd.DataFrame,
+        euler_real: pd.DataFrame,
+        dt: float = 0.004,
+        x0: Optional[np.ndarray] = None,
+    ) -> pd.DataFrame:
+        """
+        Translational-only simulation — uses the actual recorded attitude.
+
+        Avoids the fundamental problem of open-loop 6DOF simulation (torque bias
+        accumulation): attitude is taken directly from the flight log, not integrated.
+        Only position and velocity are propagated forward.
+
+        thrust_N:    DataFrame with column [F] in Newtons, positive = upward.
+                     Derived from vehicle_thrust_setpoint: F = kT * 4 * xyz[2]**2
+        euler_real:  DataFrame with columns [roll, pitch, yaw] in radians,
+                     interpolated from vehicle_attitude quaternion onto t_sim.
+        x0:          initial state [x, y, z, vx, vy, vz, ...].  Only [0:6] used.
+
+        Returns DataFrame [x, y, z, vx, vy, vz].
+        """
+        p = self.plant
+        state = np.zeros(6) if x0 is None else x0[:6].copy()
+        G = 9.81
+        drag_xy = p.drag.kD_xy
+        drag_z  = p.drag.kD_z
+        N = min(len(thrust_N), len(euler_real))
+
+        z_ground = float(state[2]) + 0.05  # NED: positive z = down; clamp prevents falling below takeoff
+
+        records = []
+        for i in range(N):
+            F    = float(thrust_N.iloc[i]["F"])
+            roll = float(euler_real.iloc[i]["roll"])
+            pitch = float(euler_real.iloc[i]["pitch"])
+            yaw  = float(euler_real.iloc[i]["yaw"])
+
+            pos, vel = state[0:3], state[3:6]
+            R = _euler_to_R(roll, pitch, yaw)
+            thrust_body = np.array([0.0, 0.0, -F])
+            a_world = R @ thrust_body / p.mass_kg + np.array([0.0, 0.0, G])
+            drag_vec = np.array([drag_xy, drag_xy, drag_z])
+            a_drag = -drag_vec * vel / p.mass_kg
+
+            state[0:3] = pos + vel * dt
+            state[3:6] = vel + (a_world + a_drag) * dt
+
+            # Ground clamp: drone cannot fall below takeoff elevation
+            if state[2] > z_ground:
+                state[2] = z_ground
+                state[5] = 0.0   # zero vertical velocity on ground contact
+
+            records.append(state.copy())
+
+        return pd.DataFrame(records, columns=["x", "y", "z", "vx", "vy", "vz"])  # type: ignore[arg-type]
 
 
 def compute_rmse(simulated: pd.DataFrame, reference: pd.DataFrame,

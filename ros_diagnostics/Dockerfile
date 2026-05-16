@@ -5,14 +5,17 @@ RUN apt-get update && apt-get install -y \
     ros-humble-diagnostic-aggregator \
     ros-humble-rqt-robot-monitor \
     python3-pip \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir 'influxdb-client>=1.18.0'
 
 WORKDIR /ros2_ws
 
-# px4_msgs injected via additional_contexts in docker-compose
-COPY --from=px4_msgs . src/px4_msgs/
+# Clone px4_msgs at the exact commit used on the drone (PX4 release/1.15)
+RUN git clone https://github.com/PX4/px4_msgs.git src/px4_msgs \
+    && git -C src/px4_msgs checkout a1045ec4feb6d709bdecaf3895f1d5b43a5dabb8
+
 COPY drone_diagnostics/ src/drone_diagnostics/
 
 RUN . /opt/ros/humble/setup.sh && \
