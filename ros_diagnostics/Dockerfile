@@ -12,9 +12,16 @@ RUN pip3 install --no-cache-dir 'influxdb-client>=1.18.0'
 
 WORKDIR /ros2_ws
 
-# Clone px4_msgs at the exact commit used on the drone (PX4 release/1.15)
-RUN git clone https://github.com/PX4/px4_msgs.git src/px4_msgs \
-    && git -C src/px4_msgs checkout a1045ec4feb6d709bdecaf3895f1d5b43a5dabb8
+# Clone px4_msgs at the commit pinned in px4_msgs.pin — the single source of
+# truth for which PX4 firmware version this workspace's message definitions
+# match. See px4_msgs.pin for the update procedure; a mismatch between this
+# pin and the real drone's firmware makes the most critical diagnostic
+# checks fail silently (CDR deserialization mismatch).
+COPY px4_msgs.pin .
+RUN . ./px4_msgs.pin \
+    && git clone https://github.com/PX4/px4_msgs.git src/px4_msgs \
+    && git -C src/px4_msgs checkout "$PX4_MSGS_COMMIT" \
+    && echo "$PX4_MSGS_COMMIT" > src/px4_msgs/.pinned_commit
 
 COPY drone_diagnostics/ src/drone_diagnostics/
 

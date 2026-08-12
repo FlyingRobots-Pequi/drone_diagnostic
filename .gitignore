@@ -3,5 +3,9 @@
 bag*
 px4_logs/
 ulg_analysis/ulg_ingestor/.ingested_logs.json
+ulg_analysis/alert_checker_state.json
+ulg_analysis/*.log
+ulg_analysis/backups/
 .env
 .env.local
+__pycache__/

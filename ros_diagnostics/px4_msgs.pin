@@ -1,0 +1,24 @@
+# Single source of truth for the px4_msgs commit this diagnostics workspace
+# is built against. The Dockerfile sources this file directly (no
+# duplicated SHA to drift out of sync), and check_px4_msgs_version.sh
+# verifies a running container's checked-out commit still matches it.
+#
+# MUST be updated together, in the same commit, whenever the PX4 firmware
+# running on the real drone changes:
+#   1. Update PX4_MSGS_COMMIT below to the px4_msgs commit matching the new
+#      firmware's message definitions (check the PX4-Autopilot release notes
+#      / the px4_msgs tag used by that PX4-Autopilot release).
+#   2. Update PX4_FIRMWARE_VERSION to the new firmware version/tag, for
+#      humans reading this file.
+#   3. Rebuild and redeploy drone_diagnostics:
+#        cd ulg_analysis && docker compose up -d --build drone_diagnostics
+#   4. Run ./check_px4_msgs_version.sh to confirm the built container
+#      actually picked up the new pin.
+#
+# Skipping this after a firmware update makes the diagnostics node
+# deserialize telemetry with a mismatched px4_msgs — the most critical
+# checks (position, EKF, failsafe) then fail silently or report garbage
+# (documented CDR mismatch issue — see docs/production_readiness_plan.md
+# gap #18).
+PX4_MSGS_COMMIT=a1045ec4feb6d709bdecaf3895f1d5b43a5dabb8
+PX4_FIRMWARE_VERSION=release/1.15

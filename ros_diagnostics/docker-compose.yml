@@ -1,3 +1,11 @@
+# DESCONTINUADO: use `../ulg_analysis/docker-compose.yml` (stack unificado)
+# em vez deste arquivo. Antes, subir so este compose project deixava
+# drone_diagnostics sem nenhuma dependencia declarada do InfluxDB — um
+# outage do InfluxDB (ou reboot do host) o deixava horas escrevendo em
+# loop de falha sem que nada o religasse na ordem certa. O compose
+# unificado adiciona `depends_on: influxdb: condition: service_healthy` e
+# sobe tudo junto com um `docker compose up -d` so. Este arquivo fica
+# apenas para referencia/rollback; nao usar em producao.
 services:
   drone_diagnostics:
     build:

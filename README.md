@@ -25,29 +25,30 @@ sudo apt install ros-humble-diagnostic-updater \
 
 ```
 Diagnostic/
-├── ulg_analysis/                # ULG flight-log analysis stack
-│   ├── docker-compose.yml       #   InfluxDB 2.7 + ulg_ingestor
+├── ulg_analysis/                # UNIFIED compose project — start here
+│   ├── docker-compose.yml       #   InfluxDB 2.7 + ulg_ingestor + drone_diagnostics
 │   ├── ulg_ingestor/            #   ingestor source + Dockerfile
 │   │   ├── ulg_ingestor.py
 │   │   ├── requirements.txt
 │   │   └── Dockerfile
 │   ├── px4_logs/                #   input .ulg log files (gitignored)
 │   └── influxdb_queries.flux    #   Flux query reference
-├── ros_diagnostics/             # ROS2 diagnostic node stack
-│   ├── docker-compose.yml       #   drone_diagnostics containerised
+├── ros_diagnostics/             # ROS2 diagnostic node source (built by
+│   │                             # ulg_analysis/docker-compose.yml)
+│   ├── docker-compose.yml       #   DEPRECATED — reference/rollback only
 │   ├── Dockerfile
 │   ├── docker-entrypoint.sh
 │   ├── run.sh                   #   local (non-Docker) launch
 │   ├── drone_diagnostics/       #   ROS2 package source
 │   │   ├── drone_diagnostics/
 │   │   │   ├── diagnostic_node.py       # 20 health checks → /diagnostics at 2 Hz
-│   │   │   └── diagnostics_logger_node.py  # optional InfluxDB writer
+│   │   │   └── diagnostics_logger_node.py  # InfluxDB writer (local durable queue)
 │   │   ├── config/
 │   │   │   └── diagnostics_config.yaml
 │   │   └── launch/
 │   │       └── drone_diagnostics.launch.py
 │   └── rosbags/                 #   test bags (gitignored)
-└── .env                         # Shared secrets — gitignored, used by both stacks
+└── .env                         # Shared secrets — gitignored, used by all services
 ```
 
 ## Diagnostic pipeline
@@ -410,6 +411,46 @@ ros2 param set /drone_diagnostic enable_takeoff_status false
 
 ---
 
+## `px4_msgs` version pin (read this before flying real hardware)
+
+`ros_diagnostics/px4_msgs.pin` is the single source of truth for which
+`px4_msgs` commit the container image is built against — it must match the
+PX4 firmware actually running on the drone, or the most critical checks
+(`PX4: Local Position`, `PX4: EKF Health`, `PX4: Failsafe Flags`) fail
+**silently** via CDR deserialization mismatches instead of loudly (this has
+already been observed with old rosbags — see the CDR issue notes further
+down). The Dockerfile sources this file directly, so there is only one
+place to update.
+
+**Whenever the drone's firmware changes:**
+1. Update `PX4_MSGS_COMMIT` (and `PX4_FIRMWARE_VERSION`) in
+   `ros_diagnostics/px4_msgs.pin` to match the new firmware.
+2. Rebuild and redeploy: `cd ulg_analysis && docker compose up -d --build drone_diagnostics`
+3. Verify: `cd ros_diagnostics && ./check_px4_msgs_version.sh`
+
+```bash
+$ ./check_px4_msgs_version.sh
+[check_px4_msgs_version] pin esperado (.../px4_msgs.pin): a1045ec4... (release/1.15)
+[check_px4_msgs_version] commit no container 'ulg_analysis-drone_diagnostics-1':    a1045ec4...
+[check_px4_msgs_version] OK: px4_msgs do container bate com o pin.
+```
+
+## `PX4: Time Sync` — SITL vs. real hardware (important, don't misread this)
+
+In **SITL** (simulation), `PX4: Time Sync` reporting ERROR is expected noise
+— the simulated clock's offset from Unix epoch is a known artifact, not a
+real problem (see the "Expected status" tables further down).
+
+In **real hardware**, this is NOT noise. A sustained ERROR on `PX4: Time
+Sync` during an actual flight is a genuine signal that the companion
+computer's clock is not synchronized (NTP/chrony not running or unstable,
+GPS/PPS time source unreliable). **Do not disable or ignore this check in
+production** just because it looks like the same "always red" behavior
+familiar from SITL testing — that similarity is coincidental, the causes
+and the correct response are completely different.
+
+---
+
 ## Build
 
 ```bash
@@ -444,28 +485,44 @@ ros2 launch drone_diagnostics drone_diagnostics.launch.py \
 ros2 run drone_diagnostics diagnostic_node
 ```
 
-## ULG Analysis stack (`ulg_analysis/`)
+## Unified stack (`ulg_analysis/docker-compose.yml`)
 
-Runs **InfluxDB 2.7** and the **ulg_ingestor** that watches `px4_logs/` for new
-`.ulg` files and writes full telemetry into the `px4_flight_logs` bucket.
+`ulg_analysis/docker-compose.yml` is the **single compose project for the
+whole logging pipeline**: InfluxDB 2.7, the **ulg_ingestor** (watches
+`px4_logs/` for new `.ulg` files and writes full telemetry into the
+`px4_flight_logs` bucket), and **drone_diagnostics** (the ROS2 diagnostic
+node + aggregator + InfluxDB logger). `drone_diagnostics` declares
+`depends_on: influxdb: condition: service_healthy`, so a single
+`docker compose up -d` here brings up everything in the right order and
+keeps it up across restarts (`restart: unless-stopped` on all three
+services). Previously `drone_diagnostics` lived in a separate
+`ros_diagnostics/docker-compose.yml` project with no dependency on this one
+— an InfluxDB outage or host reboot could silently break the pipeline for
+hours with nothing bringing InfluxDB back up (see
+`docs/production_readiness_plan.md`). `ros_diagnostics/docker-compose.yml`
+is kept only for reference/rollback — do not use it in production.
 
 ```bash
 cd ulg_analysis
 
-# Start (InfluxDB + ingestor)
-docker compose up -d
+# Start everything (InfluxDB + ingestor + diagnostics node)
+docker compose up -d --build
 
-# Watch ingestion progress
+# Watch logs
 docker compose logs -f ulg_ingestor
+docker compose logs -f drone_diagnostics
 
-# Stop (keeps data volume)
+# Stop (keeps data volumes)
 docker compose down
 
-# Stop and wipe all stored data
+# Stop and wipe all stored data (InfluxDB history AND the diagnostics
+# node's local pending-write queue)
 docker compose down -v
 ```
 
-**InfluxDB UI**: http://localhost:8086 — user `admin` / password `adminpassword123`
+**InfluxDB UI**: http://localhost:8086 — user `admin` / password from `INFLUXDB_ADMIN_PASSWORD`
+in `.env` (see `.env.example`; no hardcoded default anymore — the compose file
+refuses to start without it set).
 
 Query reference: see `influxdb_queries.flux` at the project root.
 
@@ -488,29 +545,88 @@ INFLUXDB_RETENTION=0     # infinite — manage storage yourself
 > variable above is InfluxDB's own heap budget. Setting a hard Docker
 > `mem_limit` is not recommended — it causes OOM kills during bulk ingestion.
 
----
+### Alertas minimos
 
-## ROS Diagnostics stack (`ros_diagnostics/`)
-
-Containerised version of the diagnostic node. Requires the uXRCE-DDS bridge to
-be running on the host and reachable on the same LAN segment.
+`ulg_analysis/alert_checker.py` roda uma passada (feito para cron) e avisa
+via webhook (formato Slack-compatible: `{"text": "..."}`) quando:
+- nenhum ponto novo foi escrito no InfluxDB nos ultimos N minutos (pipeline
+  parado — InfluxDB fora do ar, `drone_diagnostics` caiu, etc.); ou
+- um check especifico ficou em ERROR de forma sustentada.
 
 ```bash
-cd ros_diagnostics
+cd ulg_analysis
 
-# Build image and start node
-docker compose up -d --build
+# Teste manual (dry-run se ALERT_WEBHOOK_URL nao estiver setado)
+python3 alert_checker.py
 
-# Follow logs
-docker compose logs -f drone_diagnostics
+# Agendar via cron, a cada 5 min:
+*/5 * * * * cd /path/to/ulg_analysis && python3 alert_checker.py >> alert_checker.log 2>&1
 ```
 
-Uses `network_mode: host` so the container sees the same ROS2/DDS multicast
-traffic as the host. All InfluxDB credentials are read from the shared `.env`
-at the project root.
+Configuracao (env vars, ou `ALERT_WEBHOOK_URL` em `.env`):
 
-> **Local development**: `run.sh` at the project root builds and launches the
-> node directly on the host (no Docker) and is faster to iterate with.
+| Variavel | Default | Efeito |
+|---|---|---|
+| `WEBHOOK_URL` / `ALERT_WEBHOOK_URL` | (vazio = dry-run, so loga) | URL do webhook |
+| `NO_DATA_THRESHOLD_MIN` | `5` | Minutos sem pontos novos antes de alertar |
+| `ERROR_SUSTAINED_SAMPLES` | `10` | Amostras seguidas em ERROR antes de alertar |
+| `SITL_MODE` | `0` (hardware real) | `1` para ignorar `PX4: Time Sync` (ruido conhecido em SITL — **nao usar em producao**, ver secao acima) |
+
+Deduplica via `alert_checker_state.json` (nao versionado) — so alerta na
+transicao para o estado ruim, nao a cada execucao do cron.
+
+### Backups
+
+`ulg_analysis/backup_influxdb.sh` exports the full InfluxDB instance (all
+buckets — `drone_diagnostics` and `px4_flight_logs`) to a directory. Without
+this, `docker compose down -v`, disk corruption, or an accidental volume
+removal loses all diagnostics history and ingested `.ulg` telemetry with no
+way to recover it — the raw `.ulg` files that fed the ingestion are not
+necessarily kept elsewhere.
+
+```bash
+./backup_influxdb.sh                       # backs up to ./backups/
+./backup_influxdb.sh /mnt/nas/influx-backups  # backs up to external storage
+```
+
+Schedule it (e.g. daily via cron) and point the destination at storage
+**outside this host** — a local-only destination only protects against
+volume corruption, not host loss:
+
+```cron
+0 3 * * * cd /path/to/Flying/Diagnostic/ulg_analysis && ./backup_influxdb.sh >> backup.log 2>&1
+```
+
+The script needs `INFLUXDB_BACKUP_TOKEN` in `.env` — a separate **operator**-
+scope token (not the app's org-scoped `INFLUXDB_TOKEN`), because `influx
+backup` downloads an instance-wide metadata snapshot that an org-scoped
+all-access token cannot read. If this token is ever lost, regenerate it
+directly from disk (bypasses HTTP auth, needed because it recreates the very
+credential normal auth depends on):
+
+```bash
+docker stop ulg_analysis-influxdb-1   # exclusive access to the bolt.db file
+docker run --rm -v ulg_analysis_influxdb_data:/root/.influxdbv2 influxdb:2.7 \
+  influxd recovery auth create-operator --username admin --org aerobatics
+# copy the printed token into INFLUXDB_BACKUP_TOKEN in .env, then:
+docker start ulg_analysis-influxdb-1
+```
+
+---
+
+## `drone_diagnostics` container notes
+
+`drone_diagnostics` (part of the unified stack above) requires the
+uXRCE-DDS bridge to be running on the host and reachable on the same LAN
+segment. It uses `network_mode: host` so the container sees the same
+ROS2/DDS multicast traffic as the host. All InfluxDB credentials are read
+from the shared `.env` at the project root. Unsent diagnostics points are
+queued locally in `/var/lib/drone_diagnostics/pending.db` (a named Docker
+volume) so an InfluxDB outage never loses data, even across a container
+restart — see `diagnostics_logger_node.py`.
+
+> **Local development**: `run.sh` in `ros_diagnostics/` builds and launches
+> the node directly on the host (no Docker) and is faster to iterate with.
 
 ---
 
@@ -622,3 +738,18 @@ not error indicators.
 | `xy_valid` | No horizontal fix | Position valid horizontally |
 | `z_valid` | No altitude fix | Altitude valid |
 | `xy_global` | No GPS global fix | GPS fix available |
+
+---
+
+## CI
+
+`.github/workflows/build.yml` (this repo) builds `drone_diagnostics` against
+the pinned `px4_msgs` commit and syntax-checks `ulg_ingestor` on every push —
+runs on any GitHub-hosted runner, no GPU needed.
+
+The full end-to-end guard-corpo (nominal flight + both crash tests, checked
+against real InfluxDB data) lives in
+`uav_px4_simulator/.github/workflows/flight-tests.yml` — it needs a
+self-hosted runner with a GPU (same requirements as running the simulator
+locally), so it's kept in a separate workflow/repo rather than blocking this
+fast check.

@@ -1,3 +1,11 @@
+# Unified stack: InfluxDB + ulg_ingestor + drone_diagnostics all in one
+# compose project, so `docker compose up -d` here brings up the whole
+# logging pipeline in the right order and keeps it up across restarts.
+# (Previously drone_diagnostics lived in a separate ../ros_diagnostics
+# compose project with no dependency on this one — an InfluxDB outage or
+# host reboot could silently break the pipeline for hours with nothing
+# bringing InfluxDB back up. See docs/production_readiness_plan.md gaps
+# #1/#2.)
 services:
   influxdb:
     image: influxdb:2.7
@@ -7,7 +15,7 @@ services:
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: adminpassword123
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD:?set INFLUXDB_ADMIN_PASSWORD in .env}
       DOCKER_INFLUXDB_INIT_ORG: aerobatics
       DOCKER_INFLUXDB_INIT_BUCKET: drone_diagnostics
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
@@ -22,6 +30,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   ulg_ingestor:
     build:
@@ -37,9 +46,49 @@ services:
       ULG_WATCH_DIR: /px4_logs
       ULG_STATE_FILE: /state/.ingested_logs.json
     volumes:
-      - ./px4_logs:/px4_logs:ro
+      # Defaults to the local ./px4_logs (manual drop-in). Point this at the
+      # simulator's persistent .ulg mount instead to close the loop
+      # end-to-end (sim/flight -> .ulg -> ingestor -> InfluxDB) with no
+      # manual copy step — see uav_px4_simulator/run.sh's HOST_ULG_LOG_PATH
+      # (defaults to uav_px4_simulator/shared_folder/px4_flight_logs):
+      #   PX4_LOGS_HOST_PATH=/path/to/uav_px4_simulator/shared_folder/px4_flight_logs \
+      #     docker compose up -d
+      - ${PX4_LOGS_HOST_PATH:-./px4_logs}:/px4_logs:ro
       - ./ulg_ingestor:/state
+    restart: unless-stopped
+
+  drone_diagnostics:
+    build:
+      context: ../ros_diagnostics
+      dockerfile: Dockerfile
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    # host networking is required so the container sees ROS2/DDS traffic
+    # on the same LAN segment as the drone's uXRCE bridge. InfluxDB is
+    # still reachable at localhost:8086 because its port is published on
+    # the host (see the influxdb service's `ports:` above).
+    network_mode: host
+    env_file: ../.env
+    environment:
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+      INFLUXDB_URL: ${INFLUXDB_URL:-http://localhost:8086}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-aerobatics}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-drone_diagnostics}
+    command: >
+      ros2 launch drone_diagnostics drone_diagnostics.launch.py
+        enable_influxdb:=true
+        influxdb_url:=http://localhost:8086
+        influxdb_org:=aerobatics
+        influxdb_bucket:=drone_diagnostics
+    volumes:
+      # Durable local queue for unsent diagnostics points (see
+      # diagnostics_logger_node.py) — survives container restarts, so an
+      # InfluxDB outage never loses data even if the container itself
+      # gets recreated mid-outage.
+      - drone_diagnostics_pending:/var/lib/drone_diagnostics
     restart: unless-stopped
 
 volumes:
   influxdb_data:
+  drone_diagnostics_pending:

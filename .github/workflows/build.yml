@@ -1,0 +1,61 @@
+name: build-and-lint
+
+# Fast, GPU-free guard-corpo: catches build breakage and obvious regressions
+# in drone_diagnostics before merge, without needing a full PX4/Gazebo
+# simulation. Runs on any GitHub-hosted runner. For the full flight/crash
+# end-to-end guard-corpo (which DOES need GPU + Docker + a running
+# simulation), see uav_px4_simulator/.github/workflows/flight-tests.yml —
+# that one requires a self-hosted runner and is intentionally separate so a
+# missing GPU runner never blocks this fast check.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    paths:
+      - "ros_diagnostics/**"
+      - "ulg_analysis/**"
+
+jobs:
+  build-drone-diagnostics:
+    runs-on: ubuntu-latest
+    container: ros:humble
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax check (diagnostics_logger_node.py, diagnostic_node.py)
+        run: |
+          python3 -m py_compile \
+            ros_diagnostics/drone_diagnostics/drone_diagnostics/diagnostic_node.py \
+            ros_diagnostics/drone_diagnostics/drone_diagnostics/diagnostics_logger_node.py
+
+      - name: Verify px4_msgs.pin is well-formed
+        run: |
+          test -f ros_diagnostics/px4_msgs.pin
+          grep -q '^PX4_MSGS_COMMIT=[0-9a-f]\{40\}$' ros_diagnostics/px4_msgs.pin
+
+      - name: Build drone_diagnostics package (px4_msgs pinned commit)
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends git > /dev/null
+          mkdir -p /ros2_ws/src
+          . ros_diagnostics/px4_msgs.pin
+          git clone --quiet https://github.com/PX4/px4_msgs.git /ros2_ws/src/px4_msgs
+          git -C /ros2_ws/src/px4_msgs checkout --quiet "$PX4_MSGS_COMMIT"
+          cp -r ros_diagnostics/drone_diagnostics /ros2_ws/src/drone_diagnostics
+          cd /ros2_ws
+          . /opt/ros/humble/setup.sh
+          colcon build --packages-select px4_msgs drone_diagnostics \
+                       --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+  ulg-ingestor-syntax:
+    # ulg_ingestor has no dedicated test suite yet (ulg_analysis/tests/ is
+    # an unrelated PID-optimizer test suite, out of scope here) — this is
+    # a minimal smoke check until one exists.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r ulg_analysis/ulg_ingestor/requirements.txt
+      - run: python3 -m py_compile ulg_analysis/ulg_ingestor/ulg_ingestor.py
