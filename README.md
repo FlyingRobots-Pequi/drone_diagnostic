@@ -741,6 +741,48 @@ not error indicators.
 
 ---
 
+## Como testar
+
+### Sem ROS e sem hardware (validado em 2026-11-11, Python 3.10.12)
+
+```bash
+# venv isolado (fora do repo ou em .venv/ — nunca no Python global)
+python3 -m venv .venv
+.venv/bin/pip install numpy pandas pytest pyyaml
+
+# 1) Testes unitários do otimizador PID (ulg_analysis/tests) — 21 testes
+cd ulg_analysis && ../.venv/bin/python -m pytest && cd ..
+
+# 2) Checagens equivalentes ao CI (.github/workflows/build.yml), sem ROS
+python3 -m py_compile \
+  ros_diagnostics/drone_diagnostics/drone_diagnostics/diagnostic_node.py \
+  ros_diagnostics/drone_diagnostics/drone_diagnostics/diagnostics_logger_node.py \
+  ros_diagnostics/drone_diagnostics/launch/drone_diagnostics.launch.py \
+  ulg_analysis/ulg_ingestor/ulg_ingestor.py ulg_analysis/alert_checker.py
+grep -q '^PX4_MSGS_COMMIT=[0-9a-f]\{40\}$' ros_diagnostics/px4_msgs.pin && echo "pin OK"
+for f in ros_diagnostics/*.sh ulg_analysis/*.sh; do bash -n "$f"; done
+.venv/bin/python -c "import yaml; yaml.safe_load(open('ros_diagnostics/drone_diagnostics/config/diagnostics_config.yaml'))"
+```
+
+- `.venv/` ainda não está no `.gitignore`: não versione o venv.
+- `pytest` precisa rodar **de dentro de `ulg_analysis/`** (lá estão `pytest.ini` e o pacote `pid_optimizer`).
+- `pyproject.toml` pede Python ≥ 3.13 (via `uv`), mas os testes rodam em 3.10 só com `numpy`, `pandas` e `pytest`. Com `uv` instalado: `cd ulg_analysis && uv run pytest` (não validado aqui).
+- O pacote ROS `drone_diagnostics` **não tem testes unitários**: os health checks não têm cobertura automatizada fora do ROS.
+
+### Exige ROS 2 Humble e/ou hardware
+
+| O quê | Exige | Comando previsto |
+|-------|-------|------------------|
+| Build do pacote contra o `px4_msgs` fixado | ROS 2 + `px4_msgs` | `colcon build --packages-select px4_msgs drone_diagnostics` (ver [CI](#ci)) |
+| Testes ament (`ament_copyright`, `ament_pep8` no `package.xml`) | ROS 2 | `colcon test --packages-select drone_diagnostics && colcon test-result --verbose`. Hoje não há pasta `test/`, então nada é coletado |
+| Health checks com dados gravados | ROS 2 + rosbags (fora do git) | ver [Test with rosbag](#test-with-rosbag) |
+| Health checks ao vivo | ROS 2 + drone/PX4 (uXRCE-DDS) ou SITL | `ros2 launch drone_diagnostics drone_diagnostics.launch.py` |
+| Versão do `px4_msgs` no container | Docker + stack rodando | `ros_diagnostics/check_px4_msgs_version.sh` |
+| Ingestão de `.ulg` e alertas | InfluxDB (docker compose) + logs `.ulg` | `cd ulg_analysis && docker compose up`; `python3 alert_checker.py` |
+| Voo nominal e testes de queda (e2e) | GPU + simulador | `uav_px4_simulator/.github/workflows/flight-tests.yml` |
+
+---
+
 ## CI
 
 `.github/workflows/build.yml` (this repo) builds `drone_diagnostics` against
